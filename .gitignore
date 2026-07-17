@@ -48,3 +48,6 @@ Thumbs.db
 .cache/
 .local/
 .binance-credentials.json
+
+# Persistent store data
+artifacts/api-server/data/
