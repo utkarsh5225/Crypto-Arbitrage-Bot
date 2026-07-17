@@ -3,13 +3,24 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Triangular Arbitrage Bot API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: config
+    description: Bot configuration
+  - name: opportunities
+    description: Arbitrage opportunity history
+  - name: trades
+    description: Paper trade history
+  - name: stats
+    description: Aggregated statistics
+  - name: stream
+    description: Server-sent events stream
+
 paths:
   /healthz:
     get:
@@ -24,6 +35,117 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /config:
+    get:
+      operationId: getConfig
+      tags: [config]
+      summary: Get bot configuration
+      description: Returns current fee rate and minimum profit threshold
+      responses:
+        "200":
+          description: Current configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotConfig"
+    put:
+      operationId: updateConfig
+      tags: [config]
+      summary: Update bot configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotConfigInput"
+      responses:
+        "200":
+          description: Updated configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotConfig"
+
+  /opportunities:
+    get:
+      operationId: getOpportunities
+      tags: [opportunities]
+      summary: Get recent arbitrage opportunities
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: Max number of opportunities to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Pagination offset
+      responses:
+        "200":
+          description: List of recent opportunities
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpportunitiesResponse"
+
+  /trades:
+    get:
+      operationId: getTrades
+      tags: [trades]
+      summary: Get paper trade history
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: Max number of trades to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Pagination offset
+      responses:
+        "200":
+          description: List of paper trades
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradesResponse"
+
+  /stats:
+    get:
+      operationId: getStats
+      tags: [stats]
+      summary: Get aggregated bot statistics
+      responses:
+        "200":
+          description: Bot statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStats"
+
+  /stream:
+    get:
+      operationId: getStream
+      tags: [stream]
+      summary: SSE stream for real-time updates
+      description: Server-sent events stream delivering opportunity, trade, stats, and scanner_status events
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +156,183 @@ components:
       required:
         - status
 
+    BotConfig:
+      type: object
+      properties:
+        feeRate:
+          type: number
+          description: Fee per trade leg as a decimal (e.g. 0.001 = 0.1%)
+        minProfitThreshold:
+          type: number
+          description: Minimum net profit % to trigger paper trade (e.g. 0.001 = 0.1%)
+        notionalSize:
+          type: number
+          description: Fixed notional trade size in USDT
+      required:
+        - feeRate
+        - minProfitThreshold
+        - notionalSize
+
+    BotConfigInput:
+      type: object
+      properties:
+        feeRate:
+          type: number
+        minProfitThreshold:
+          type: number
+        notionalSize:
+          type: number
+
+    ArbitrageOpportunity:
+      type: object
+      properties:
+        id:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        path:
+          type: array
+          items:
+            type: string
+          description: Symbols in the triangle path e.g. ["USDT","BTC","ETH","USDT"]
+        symbols:
+          type: array
+          items:
+            type: string
+          description: Trading pair symbols used e.g. ["BTCUSDT","ETHBTC","ETHUSDT"]
+        prices:
+          type: array
+          items:
+            type: number
+          description: Prices used for each leg
+        grossProfitPct:
+          type: number
+          description: Gross profit percentage before fees
+        netProfitPct:
+          type: number
+          description: Net profit percentage after fees
+        wasPaperTraded:
+          type: boolean
+      required:
+        - id
+        - timestamp
+        - path
+        - symbols
+        - prices
+        - grossProfitPct
+        - netProfitPct
+        - wasPaperTraded
+
+    OpportunitiesResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArbitrageOpportunity"
+        total:
+          type: integer
+      required:
+        - data
+        - total
+
+    PaperTrade:
+      type: object
+      properties:
+        id:
+          type: string
+        opportunityId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        path:
+          type: array
+          items:
+            type: string
+        symbols:
+          type: array
+          items:
+            type: string
+        prices:
+          type: array
+          items:
+            type: number
+        notionalSize:
+          type: number
+        grossProfitUsd:
+          type: number
+        netProfitUsd:
+          type: number
+        netProfitPct:
+          type: number
+      required:
+        - id
+        - opportunityId
+        - timestamp
+        - path
+        - symbols
+        - prices
+        - notionalSize
+        - grossProfitUsd
+        - netProfitUsd
+        - netProfitPct
+
+    TradesResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/PaperTrade"
+        total:
+          type: integer
+      required:
+        - data
+        - total
+
+    BotStats:
+      type: object
+      properties:
+        totalOpportunities:
+          type: integer
+          description: Total opportunities detected since start
+        totalTrades:
+          type: integer
+          description: Total paper trades executed
+        totalProfitUsd:
+          type: number
+          description: Cumulative net P&L in USD
+        winRate:
+          type: number
+          description: Fraction of trades that were profitable (should be 1.0 since we only trade profitable ones)
+        pairsTracked:
+          type: integer
+          description: Number of trading pairs in the price map
+        pathsEvaluated:
+          type: integer
+          description: Total triangle paths evaluated since start
+        pathsPerSecond:
+          type: number
+          description: Moving average of paths evaluated per second
+        scannerConnected:
+          type: boolean
+          description: Whether the Binance WebSocket is connected
+        uptimeSeconds:
+          type: number
+          description: Seconds since the scanner started
+        opportunitiesPerMinute:
+          type: number
+          description: Moving average of opportunities found per minute
+      required:
+        - totalOpportunities
+        - totalTrades
+        - totalProfitUsd
+        - winRate
+        - pairsTracked
+        - pathsEvaluated
+        - pathsPerSecond
+        - scannerConnected
+        - uptimeSeconds
+        - opportunitiesPerMinute
