@@ -85,6 +85,11 @@ export default function Dashboard() {
   const [apiSecretInput, setApiSecretInput] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
   const [showApiSecret, setShowApiSecret] = useState(false);
+  const [serverIp, setServerIp] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch('/api/my-ip').then(r => r.json()).then(d => setServerIp(d.ip)).catch(() => {});
+  }, []);
 
   // ── Live mode confirmation modal ───────────────────────────────────────────
   const [showLiveConfirm, setShowLiveConfirm] = useState(false);
@@ -425,6 +430,12 @@ export default function Dashboard() {
                     : <span className="text-[10px] text-destructive">✗ Not configured</span>
                   }
                 </div>
+                {serverIp && (
+                  <div className="mb-2 flex items-center gap-1.5 text-[10px] text-muted-foreground bg-muted/30 rounded px-2 py-1.5">
+                    <span className="shrink-0">Whitelist this IP in Binance:</span>
+                    <code className="text-amber-400 font-bold select-all">{serverIp}</code>
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-2">
                   <div className="relative">
                     <Input
