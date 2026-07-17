@@ -15,4 +15,5 @@ export * from './getTradesParams';
 export * from './healthStatus';
 export * from './opportunitiesResponse';
 export * from './paperTrade';
+export * from './topOpportunity';
 export * from './tradesResponse';

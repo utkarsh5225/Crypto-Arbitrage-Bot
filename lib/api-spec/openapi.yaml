@@ -292,6 +292,36 @@ components:
         - data
         - total
 
+    TopOpportunity:
+      type: object
+      description: A compact snapshot of a triangle's best evaluation result
+      properties:
+        path:
+          type: array
+          items:
+            type: string
+          description: Currency path e.g. ["USDT","BTC","ETH","USDT"]
+        symbols:
+          type: array
+          items:
+            type: string
+          description: Trading pair symbols for each leg
+        grossProfitPct:
+          type: number
+          description: Gross profit as a decimal before fees
+        netProfitPct:
+          type: number
+          description: Net profit as a decimal after fees
+        timestamp:
+          type: string
+          format: date-time
+      required:
+        - path
+        - symbols
+        - grossProfitPct
+        - netProfitPct
+        - timestamp
+
     BotStats:
       type: object
       properties:
@@ -325,6 +355,16 @@ components:
         opportunitiesPerMinute:
           type: number
           description: Moving average of opportunities found per minute
+        topScan:
+          type: array
+          items:
+            $ref: "#/components/schemas/TopOpportunity"
+          description: Top 5 triangles from the most recent 2-second scan window
+        topToday:
+          type: array
+          items:
+            $ref: "#/components/schemas/TopOpportunity"
+          description: Top 5 best triangles seen today (since server start), by net profit
       required:
         - totalOpportunities
         - totalTrades
@@ -336,3 +376,5 @@ components:
         - scannerConnected
         - uptimeSeconds
         - opportunitiesPerMinute
+        - topScan
+        - topToday

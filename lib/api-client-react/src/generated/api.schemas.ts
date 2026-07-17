@@ -63,6 +63,21 @@ export interface TradesResponse {
   total: number;
 }
 
+/**
+ * A compact snapshot of a triangle's best evaluation result
+ */
+export interface TopOpportunity {
+  /** Currency path e.g. ["USDT","BTC","ETH","USDT"] */
+  path: string[];
+  /** Trading pair symbols for each leg */
+  symbols: string[];
+  /** Gross profit as a decimal before fees */
+  grossProfitPct: number;
+  /** Net profit as a decimal after fees */
+  netProfitPct: number;
+  timestamp: string;
+}
+
 export interface BotStats {
   /** Total opportunities detected since start */
   totalOpportunities: number;
@@ -84,6 +99,10 @@ export interface BotStats {
   uptimeSeconds: number;
   /** Moving average of opportunities found per minute */
   opportunitiesPerMinute: number;
+  /** Top 5 triangles from the most recent 2-second scan window */
+  topScan: TopOpportunity[];
+  /** Top 5 best triangles seen today (since server start), by net profit */
+  topToday: TopOpportunity[];
 }
 
 export type GetOpportunitiesParams = {

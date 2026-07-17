@@ -111,7 +111,21 @@ export const GetStatsResponse = zod.object({
   "pathsPerSecond": zod.number().describe('Moving average of paths evaluated per second'),
   "scannerConnected": zod.boolean().describe('Whether the Binance WebSocket is connected'),
   "uptimeSeconds": zod.number().describe('Seconds since the scanner started'),
-  "opportunitiesPerMinute": zod.number().describe('Moving average of opportunities found per minute')
+  "opportunitiesPerMinute": zod.number().describe('Moving average of opportunities found per minute'),
+  "topScan": zod.array(zod.object({
+  "path": zod.array(zod.string()).describe('Currency path e.g. [\"USDT\",\"BTC\",\"ETH\",\"USDT\"]'),
+  "symbols": zod.array(zod.string()).describe('Trading pair symbols for each leg'),
+  "grossProfitPct": zod.number().describe('Gross profit as a decimal before fees'),
+  "netProfitPct": zod.number().describe('Net profit as a decimal after fees'),
+  "timestamp": zod.coerce.date()
+}).describe('A compact snapshot of a triangle\'s best evaluation result')).describe('Top 5 triangles from the most recent 2-second scan window'),
+  "topToday": zod.array(zod.object({
+  "path": zod.array(zod.string()).describe('Currency path e.g. [\"USDT\",\"BTC\",\"ETH\",\"USDT\"]'),
+  "symbols": zod.array(zod.string()).describe('Trading pair symbols for each leg'),
+  "grossProfitPct": zod.number().describe('Gross profit as a decimal before fees'),
+  "netProfitPct": zod.number().describe('Net profit as a decimal after fees'),
+  "timestamp": zod.coerce.date()
+}).describe('A compact snapshot of a triangle\'s best evaluation result')).describe('Top 5 best triangles seen today (since server start), by net profit')
 })
 
 

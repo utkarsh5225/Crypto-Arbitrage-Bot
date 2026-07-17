@@ -10,6 +10,7 @@ import {
   getGetStatsQueryKey,
   getGetConfigQueryKey
 } from '@workspace/api-client-react';
+import type { TopOpportunity } from '@workspace/api-client-react';
 import { useBotStream } from '@/hooks/use-bot-stream';
 import { formatPercent, formatUsd, formatUptime, cn } from '@/lib/utils';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -20,7 +21,7 @@ import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { ValueFlash } from '@/components/ValueFlash';
 import { formatDistanceToNow } from 'date-fns';
-import { Activity, Zap, Server, Settings2, BarChart2, ShieldAlert } from 'lucide-react';
+import { Activity, Zap, Settings2, BarChart2, TrendingUp, Trophy } from 'lucide-react';
 import { toast } from 'sonner';
 
 export default function Dashboard() {
@@ -278,6 +279,25 @@ export default function Dashboard() {
 
         </div>
       </div>
+
+      {/* Top 5 Panels */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <TopOpportunitiesCard
+          title="Top 5 This Scan"
+          subtitle="Best triangles in the last 2s window"
+          icon={<TrendingUp className="h-4 w-4 text-primary" />}
+          items={stats?.topScan ?? []}
+          emptyMessage="Waiting for first scan window..."
+        />
+        <TopOpportunitiesCard
+          title="Top 5 Today"
+          subtitle="Best triangles since server start"
+          icon={<Trophy className="h-4 w-4 text-amber-400" />}
+          items={stats?.topToday ?? []}
+          emptyMessage="No data yet — scanning in progress..."
+          highlight
+        />
+      </div>
     </div>
   );
 }
@@ -304,4 +324,82 @@ function formatRelativeTime(isoString: string) {
   } catch (e) {
     return isoString;
   }
+}
+
+function TopOpportunitiesCard({
+  title,
+  subtitle,
+  icon,
+  items,
+  emptyMessage,
+  highlight = false,
+}: {
+  title: string;
+  subtitle: string;
+  icon: React.ReactNode;
+  items: TopOpportunity[];
+  emptyMessage: string;
+  highlight?: boolean;
+}) {
+  return (
+    <Card className="bg-card border-border">
+      <CardHeader className="py-3 flex flex-row items-center justify-between">
+        <div className="flex items-center gap-2">
+          {icon}
+          <div>
+            <CardTitle className="text-sm">{title}</CardTitle>
+            <p className="text-[10px] text-muted-foreground uppercase tracking-wider mt-0.5">{subtitle}</p>
+          </div>
+        </div>
+        <Badge variant="outline" className="text-[10px] bg-background">Top 5</Badge>
+      </CardHeader>
+      <CardContent className="p-0">
+        <Table>
+          <TableHeader className="sticky top-0 bg-card z-10 border-b border-border">
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="w-6 text-center text-muted-foreground pl-3">#</TableHead>
+              <TableHead>Path</TableHead>
+              <TableHead className="text-right">Gross</TableHead>
+              <TableHead className="text-right pr-4">Net</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {items.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={4} className="h-20 text-center text-muted-foreground text-xs">
+                  {emptyMessage}
+                </TableCell>
+              </TableRow>
+            ) : (
+              items.map((item, i) => {
+                const isPositive = item.netProfitPct > 0;
+                const rankColors = ['text-amber-400', 'text-slate-400', 'text-orange-700', 'text-muted-foreground', 'text-muted-foreground'];
+                return (
+                  <TableRow key={item.path.join('/')} className="text-xs border-border/40">
+                    <TableCell className={cn("pl-3 font-bold text-center", rankColors[i] ?? 'text-muted-foreground')}>
+                      {i + 1}
+                    </TableCell>
+                    <TableCell className="font-medium tracking-tight">
+                      <ValueFlash value={item.path.join(' → ')} type="text" />
+                    </TableCell>
+                    <TableCell className="text-right text-muted-foreground whitespace-nowrap">
+                      <ValueFlash value={formatPercent(item.grossProfitPct)} type="number" />
+                    </TableCell>
+                    <TableCell className={cn(
+                      "text-right font-bold pr-4 whitespace-nowrap",
+                      isPositive
+                        ? (highlight ? 'text-amber-400' : 'text-green-400')
+                        : 'text-muted-foreground'
+                    )}>
+                      <ValueFlash value={formatPercent(item.netProfitPct)} type="number" />
+                    </TableCell>
+                  </TableRow>
+                );
+              })
+            )}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
 }

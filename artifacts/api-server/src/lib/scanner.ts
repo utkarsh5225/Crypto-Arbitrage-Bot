@@ -1,6 +1,6 @@
 import WebSocket from "ws";
 import { logger } from "./logger";
-import { store } from "./store";
+import { store, type TopOpportunity } from "./store";
 import { sseManager } from "./sse-manager";
 
 interface PriceEntry {
@@ -32,7 +32,7 @@ const BASE_CURRENCIES = ["USDT", "BTC", "ETH", "BNB"] as const;
 // Instead, open multiple WS connections each subscribing to ≤500 symbols.
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws";
 const BINANCE_EXCHANGE_URL = "https://api.binance.com/api/v3/exchangeInfo";
-const MAX_SYMBOLS_PER_CONNECTION = 500; // safely under Binance's 1024-stream limit
+const MAX_SYMBOLS_PER_CONNECTION = 200; // 247 stayed stable; 500 gets dropped — keep well under that
 
 const priceMap = new Map<string, PriceEntry>();
 let symbolToTriangles = new Map<string, Triangle[]>();
@@ -146,6 +146,10 @@ function evalTriangle(
 // Symbol update handler
 // ---------------------------------------------------------------------------
 
+// Tracks the best result per triangle path within the current 2-second window.
+// Keyed by "START/MID/END" (the deduplicated triangle key).
+const windowCandidates = new Map<string, TopOpportunity>();
+
 function checkSymbol(symbol: string): void {
   const triangles = symbolToTriangles.get(symbol);
   if (!triangles?.length) return;
@@ -153,9 +157,27 @@ function checkSymbol(symbol: string): void {
   const { minProfitThreshold, notionalSize } = store.config;
   store.incrementPaths(triangles.length);
 
+  const now = new Date().toISOString();
+
   for (const tri of triangles) {
     const result = evalTriangle(tri);
-    if (!result || result.netPct < minProfitThreshold) continue;
+    if (!result) continue;
+
+    // ── Window-best tracking (always, regardless of threshold) ──────────────
+    const pathKey = `${tri.path[0]}/${tri.path[1]}/${tri.path[2]}`;
+    const prev = windowCandidates.get(pathKey);
+    if (!prev || result.netPct > prev.netProfitPct) {
+      windowCandidates.set(pathKey, {
+        path: [...tri.path],
+        symbols: [...tri.symbols],
+        grossProfitPct: result.grossPct,
+        netProfitPct: result.netPct,
+        timestamp: now,
+      });
+    }
+
+    // ── Paper-trade only when profitable ────────────────────────────────────
+    if (result.netPct < minProfitThreshold) continue;
 
     // Record opportunity
     const opp = store.addOpportunity({
@@ -344,8 +366,11 @@ export async function startScanner(): Promise<void> {
 
   connectWS();
 
-  // Broadcast stats every 2 seconds
+  // Broadcast stats every 2 seconds, flushing the window candidates first
   setInterval(() => {
+    const candidates = [...windowCandidates.values()];
+    windowCandidates.clear();
+    store.setTopScan(candidates);
     sseManager.broadcast("stats", store.getStats());
   }, 2_000);
 

@@ -30,8 +30,17 @@ export interface PaperTrade {
   netProfitPct: number;
 }
 
+export interface TopOpportunity {
+  path: string[];
+  symbols: string[];
+  grossProfitPct: number;
+  netProfitPct: number;
+  timestamp: string; // ISO string
+}
+
 const MAX_OPPORTUNITIES = 500;
 const MAX_TRADES = 500;
+const TOP_N = 5;
 
 class Store {
   config: BotConfig = {
@@ -50,6 +59,12 @@ class Store {
   pathsEvaluated = 0;
   scannerConnected = false;
   startTime = Date.now();
+
+  // Top 5 of today — best by netProfitPct seen since start
+  topToday: TopOpportunity[] = [];
+
+  // Top 5 from the current scan window — set by the scanner each broadcast
+  topScan: TopOpportunity[] = [];
 
   // Rolling rate tracking
   private pathWindowCount = 0;
@@ -87,6 +102,38 @@ class Store {
     }
   }
 
+  /** Called by the scanner with the best candidates from the last 2s window */
+  setTopScan(candidates: TopOpportunity[]): void {
+    // Sort descending by netProfitPct and keep top N
+    this.topScan = candidates
+      .sort((a, b) => b.netProfitPct - a.netProfitPct)
+      .slice(0, TOP_N);
+
+    // Merge into topToday: insert each candidate, resort, trim
+    for (const c of this.topScan) {
+      // Replace an existing entry for the same path if the new one is better
+      const key = c.path.join("/");
+      const existing = this.topToday.findIndex(
+        (t) => t.path.join("/") === key
+      );
+      if (existing !== -1) {
+        if (c.netProfitPct > this.topToday[existing].netProfitPct) {
+          this.topToday[existing] = c;
+        }
+      } else {
+        // Only add if it would make the top N, or we have fewer than N
+        if (
+          this.topToday.length < TOP_N ||
+          c.netProfitPct > this.topToday[this.topToday.length - 1].netProfitPct
+        ) {
+          this.topToday.push(c);
+        }
+      }
+      this.topToday.sort((a, b) => b.netProfitPct - a.netProfitPct);
+      if (this.topToday.length > TOP_N) this.topToday.length = TOP_N;
+    }
+  }
+
   getStats() {
     const now = Date.now();
     const cutoff = now - 60_000;
@@ -103,6 +150,8 @@ class Store {
       scannerConnected: this.scannerConnected,
       uptimeSeconds: (now - this.startTime) / 1000,
       opportunitiesPerMinute: this.oppTimestamps.length,
+      topScan: this.topScan,
+      topToday: this.topToday,
     };
   }
 }
