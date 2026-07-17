@@ -66,6 +66,12 @@ const MAX_SYMBOLS_PER_CONNECTION = 200; // 247 stayed stable; 500 gets dropped �
 // Cooldown: don't trade the same triangle within this window to avoid rapid-fire doubles
 const TRADE_COOLDOWN_MS = 5_000;
 
+// Auto-kill after this many consecutive live trade failures
+const MAX_CONSECUTIVE_FAILURES = 3;
+
+/** Counts back-to-back live trade failures; reset to 0 on any success. */
+let consecutiveLiveFailures = 0;
+
 const priceMap = new Map<string, PriceEntry>();
 let symbolToTriangles = new Map<string, Triangle[]>();
 let exchangeInfoLoaded = false;
@@ -261,6 +267,9 @@ function checkSymbol(symbol: string): void {
         // Fire live trade asynchronously — never block the WS message handler
         executeLiveTrade(tri, opp.id, tradeNotional, creds.apiKey, creds.apiSecret)
           .then((liveResult) => {
+            // Success — reset consecutive failure counter
+            consecutiveLiveFailures = 0;
+
             const trade = store.addTrade({
               opportunityId: opp.id,
               timestamp: new Date(),
@@ -295,12 +304,53 @@ function checkSymbol(symbol: string): void {
             });
           })
           .catch((err) => {
+            const errorMsg = err instanceof Error ? err.message : String(err);
             logger.error({ err, path: tri.path.join("→") }, "Live trade failed");
+
+            // Parse which leg failed from the error message ("Leg N (…) failed: …")
+            const legMatch = errorMsg.match(/Leg (\d+)/);
+            const failedLeg = legMatch ? parseInt(legMatch[1], 10) : 0;
+
+            // Record a sentinel entry in Order History so the failure is visible
+            store.addLiveOrders([{
+              orderId: -Date.now(),
+              symbol: tri.symbols[Math.max(0, failedLeg - 1)] ?? tri.symbols[0],
+              side: tri.buys[Math.max(0, failedLeg - 1)] ? "BUY" : "SELL",
+              executedQty: 0,
+              avgPrice: 0,
+              status: "ERROR",
+              timestamp: new Date().toISOString(),
+              leg: failedLeg || 1,
+              trianglePath: tri.path.join("→"),
+            }]);
+
+            // Broadcast the failure event so the dashboard can alert the user
+            sseManager.broadcast("live_trade_failed", {
+              path: tri.path,
+              failedLeg,
+              error: errorMsg,
+              timestamp: new Date().toISOString(),
+            });
+
             // Broadcast the opportunity even on failure so user can see it was spotted
             sseManager.broadcast("opportunity", {
               ...opp,
               timestamp: opp.timestamp.toISOString(),
             });
+
+            // Auto-kill after MAX_CONSECUTIVE_FAILURES back-to-back failures
+            consecutiveLiveFailures++;
+            if (consecutiveLiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+              consecutiveLiveFailures = 0;
+              if (store.config.tradingMode === "live") {
+                store.config.tradingMode = "paper";
+                logger.warn(
+                  { failures: MAX_CONSECUTIVE_FAILURES },
+                  "Auto-kill triggered after consecutive live trade failures — reverted to paper mode",
+                );
+                sseManager.broadcast("stats", store.getStats());
+              }
+            }
           });
 
         continue; // Do not fall through to paper trade

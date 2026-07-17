@@ -8,9 +8,17 @@ import { getGetStatsQueryKey, getGetOpportunitiesQueryKey, getGetTradesQueryKey 
 const OPP_PARAMS = { limit: 50 } as const;
 const TRADES_PARAMS = { limit: 50 } as const;
 
+export interface LiveTradeFailure {
+  path: string[];
+  failedLeg: number;
+  error: string;
+  timestamp: string;
+}
+
 export function useBotStream() {
   const queryClient = useQueryClient();
   const [scannerConnected, setScannerConnected] = useState(false);
+  const [liveTradeFailure, setLiveTradeFailure] = useState<LiveTradeFailure | null>(null);
 
   useEffect(() => {
     const es = new EventSource('/api/stream');
@@ -54,10 +62,17 @@ export function useBotStream() {
       } catch (err) {}
     });
 
+    es.addEventListener('live_trade_failed', (e) => {
+      try {
+        const failure = JSON.parse(e.data) as LiveTradeFailure;
+        setLiveTradeFailure(failure);
+      } catch (_e) {}
+    });
+
     return () => {
       es.close();
     };
   }, [queryClient]);
 
-  return { scannerConnected };
+  return { scannerConnected, liveTradeFailure, dismissFailure: () => setLiveTradeFailure(null) };
 }

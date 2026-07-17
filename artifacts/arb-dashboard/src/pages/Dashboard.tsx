@@ -38,7 +38,7 @@ import { toast } from 'sonner';
 
 export default function Dashboard() {
   const queryClient = useQueryClient();
-  const { scannerConnected } = useBotStream();
+  const { scannerConnected, liveTradeFailure, dismissFailure } = useBotStream();
 
   // ── Server data ────────────────────────────────────────────────────────────
   const { data: stats } = useGetStats({ query: { queryKey: getGetStatsQueryKey() } });
@@ -251,6 +251,24 @@ export default function Dashboard() {
           </div>
         </div>
       </header>
+
+      {/* ── Live Trade Failure Banner ────────────────────────────────────────── */}
+      {liveTradeFailure && (
+        <div className="flex items-start gap-3 rounded-lg border border-destructive/60 bg-destructive/10 px-4 py-3 text-sm text-destructive animate-in slide-in-from-top-2">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="font-bold uppercase tracking-wider text-xs mb-0.5">Live Trade Failed</p>
+            <p className="text-xs text-muted-foreground">
+              Path: <span className="font-mono text-foreground">{liveTradeFailure.path.join(' → ')}</span>
+              {liveTradeFailure.failedLeg > 0 && (
+                <> · Leg <span className="font-bold">{liveTradeFailure.failedLeg}</span></>
+              )}
+              {' · '}{liveTradeFailure.error}
+            </p>
+          </div>
+          <button onClick={dismissFailure} className="shrink-0 text-muted-foreground hover:text-foreground leading-none text-lg font-bold">×</button>
+        </div>
+      )}
 
       {/* ── Stats Strip ──────────────────────────────────────────────────────── */}
       <div className={cn('grid gap-4', isLive ? 'grid-cols-2 md:grid-cols-6' : 'grid-cols-2 md:grid-cols-5')}>
@@ -696,7 +714,7 @@ function OrderHistoryPanel({ orders }: { orders: LiveOrder[] }) {
               <TableHead>Symbol</TableHead>
               <TableHead className="text-center w-12">Leg</TableHead>
               <TableHead className="text-center w-12">Side</TableHead>
-              <TableHead className="text-right">Qty</TableHead>
+              <TableHead className="text-center w-16">Status</TableHead>
               <TableHead className="text-right pr-4">Avg Price</TableHead>
             </TableRow>
           </TableHeader>
@@ -707,22 +725,38 @@ function OrderHistoryPanel({ orders }: { orders: LiveOrder[] }) {
                   No live orders placed yet.
                 </TableCell>
               </TableRow>
-            ) : orders.map((o) => (
-              <TableRow key={`${o.orderId}-${o.leg}`} className="text-xs border-border/40">
-                <TableCell className="font-medium">{o.symbol}</TableCell>
-                <TableCell className="text-center text-muted-foreground">{o.leg}</TableCell>
-                <TableCell className="text-center">
-                  <Badge
-                    className={cn('text-[8px] px-1 py-0 h-3.5', o.side === 'BUY' ? 'bg-green-500/20 text-green-400 border-green-500/30' : 'bg-red-500/20 text-red-400 border-red-500/30')}
-                    variant="outline"
-                  >
-                    {o.side}
-                  </Badge>
-                </TableCell>
-                <TableCell className="text-right font-mono">{o.executedQty.toFixed(6)}</TableCell>
-                <TableCell className="text-right pr-4 text-muted-foreground font-mono">{o.avgPrice.toFixed(4)}</TableCell>
-              </TableRow>
-            ))}
+            ) : orders.map((o) => {
+              const isError = o.status === 'ERROR';
+              return (
+                <TableRow
+                  key={`${o.orderId}-${o.leg}-${o.timestamp}`}
+                  className={cn('text-xs border-border/40', isError && 'bg-destructive/5')}
+                >
+                  <TableCell className={cn('font-medium', isError && 'text-destructive')}>{o.symbol}</TableCell>
+                  <TableCell className="text-center text-muted-foreground">{o.leg}</TableCell>
+                  <TableCell className="text-center">
+                    <Badge
+                      className={cn('text-[8px] px-1 py-0 h-3.5', o.side === 'BUY' ? 'bg-green-500/20 text-green-400 border-green-500/30' : 'bg-red-500/20 text-red-400 border-red-500/30')}
+                      variant="outline"
+                    >
+                      {o.side}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-center">
+                    {isError ? (
+                      <Badge className="text-[8px] px-1 py-0 h-3.5 bg-destructive/20 text-destructive border-destructive/40" variant="outline">
+                        ERROR
+                      </Badge>
+                    ) : (
+                      <span className="text-[10px] text-muted-foreground font-mono">{o.status}</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right pr-4 text-muted-foreground font-mono">
+                    {isError ? <span className="text-destructive/60">—</span> : o.avgPrice.toFixed(4)}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       </CardContent>
