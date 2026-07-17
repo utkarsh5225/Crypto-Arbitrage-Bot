@@ -23,8 +23,12 @@ export const HealthCheckResponse = zod.object({
  */
 export const GetConfigResponse = zod.object({
   "feeRate": zod.number().describe('Fee per trade leg as a decimal (e.g. 0.001 = 0.1%)'),
-  "minProfitThreshold": zod.number().describe('Minimum net profit % to trigger paper trade (e.g. 0.001 = 0.1%)'),
-  "notionalSize": zod.number().describe('Fixed notional trade size in USDT')
+  "minProfitThreshold": zod.number().describe('Minimum net profit % to trigger trade (e.g. 0.001 = 0.1%)'),
+  "notionalSize": zod.number().describe('Fixed notional trade size in USDT'),
+  "tradingMode": zod.enum(['paper', 'live']).describe('Whether to paper-trade or execute real orders on Binance'),
+  "maxNotionalPerTrade": zod.number().describe('Maximum USDT notional per live trade (safety cap)'),
+  "dailyLossLimitUsd": zod.number().describe('Revert to paper mode if realised daily loss exceeds this value'),
+  "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)')
 })
 
 
@@ -34,13 +38,45 @@ export const GetConfigResponse = zod.object({
 export const UpdateConfigBody = zod.object({
   "feeRate": zod.number().optional(),
   "minProfitThreshold": zod.number().optional(),
-  "notionalSize": zod.number().optional()
+  "notionalSize": zod.number().optional(),
+  "tradingMode": zod.enum(['paper', 'live']).optional(),
+  "maxNotionalPerTrade": zod.number().optional(),
+  "dailyLossLimitUsd": zod.number().optional()
 })
 
 export const UpdateConfigResponse = zod.object({
   "feeRate": zod.number().describe('Fee per trade leg as a decimal (e.g. 0.001 = 0.1%)'),
-  "minProfitThreshold": zod.number().describe('Minimum net profit % to trigger paper trade (e.g. 0.001 = 0.1%)'),
-  "notionalSize": zod.number().describe('Fixed notional trade size in USDT')
+  "minProfitThreshold": zod.number().describe('Minimum net profit % to trigger trade (e.g. 0.001 = 0.1%)'),
+  "notionalSize": zod.number().describe('Fixed notional trade size in USDT'),
+  "tradingMode": zod.enum(['paper', 'live']).describe('Whether to paper-trade or execute real orders on Binance'),
+  "maxNotionalPerTrade": zod.number().describe('Maximum USDT notional per live trade (safety cap)'),
+  "dailyLossLimitUsd": zod.number().describe('Revert to paper mode if realised daily loss exceeds this value'),
+  "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)')
+})
+
+
+/**
+ * Returns whether credentials are configured; never returns the actual key/secret values
+ * @summary Get Binance API credential status
+ */
+export const GetCredentialsResponse = zod.object({
+  "configured": zod.boolean().describe('Whether credentials are currently set'),
+  "maskedKey": zod.string().optional().describe('Masked API key for display (first 4 + last 4 chars only)')
+})
+
+
+/**
+ * Stores the API key and secret securely on the server
+ * @summary Save Binance API credentials
+ */
+export const SetCredentialsBody = zod.object({
+  "apiKey": zod.string().describe('Binance API key'),
+  "apiSecret": zod.string().describe('Binance API secret')
+})
+
+export const SetCredentialsResponse = zod.object({
+  "configured": zod.boolean().describe('Whether credentials are currently set'),
+  "maskedKey": zod.string().optional().describe('Masked API key for display (first 4 + last 4 chars only)')
 })
 
 
@@ -71,7 +107,7 @@ export const GetOpportunitiesResponse = zod.object({
 
 
 /**
- * @summary Get paper trade history
+ * @summary Get trade history
  */
 export const getTradesQueryLimitDefault = 50;
 export const getTradesQueryOffsetDefault = 0;
@@ -92,7 +128,10 @@ export const GetTradesResponse = zod.object({
   "notionalSize": zod.number(),
   "grossProfitUsd": zod.number(),
   "netProfitUsd": zod.number(),
-  "netProfitPct": zod.number()
+  "netProfitPct": zod.number(),
+  "mode": zod.enum(['paper', 'live']).optional().describe('Whether this was a simulated or real executed trade'),
+  "orderIds": zod.array(zod.number()).optional().describe('Binance order IDs for each leg (live trades only)'),
+  "fillPrices": zod.array(zod.number()).optional().describe('Actual fill prices from Binance for each leg (live trades only)')
 })),
   "total": zod.number()
 })
@@ -103,9 +142,9 @@ export const GetTradesResponse = zod.object({
  */
 export const GetStatsResponse = zod.object({
   "totalOpportunities": zod.number().describe('Total opportunities detected since start'),
-  "totalTrades": zod.number().describe('Total paper trades executed'),
+  "totalTrades": zod.number().describe('Total trades executed'),
   "totalProfitUsd": zod.number().describe('Cumulative net P&L in USD'),
-  "winRate": zod.number().describe('Fraction of trades that were profitable (should be 1.0 since we only trade profitable ones)'),
+  "winRate": zod.number().describe('Fraction of trades that were profitable'),
   "pairsTracked": zod.number().describe('Number of trading pairs in the price map'),
   "pathsEvaluated": zod.number().describe('Total triangle paths evaluated since start'),
   "pathsPerSecond": zod.number().describe('Moving average of paths evaluated per second'),
@@ -125,7 +164,9 @@ export const GetStatsResponse = zod.object({
   "grossProfitPct": zod.number().describe('Gross profit as a decimal before fees'),
   "netProfitPct": zod.number().describe('Net profit as a decimal after fees'),
   "timestamp": zod.coerce.date()
-}).describe('A compact snapshot of a triangle\'s best evaluation result')).describe('Top 5 best triangles seen today (since server start), by net profit')
+}).describe('A compact snapshot of a triangle\'s best evaluation result')).describe('Top 5 best triangles seen today (since server start), by net profit'),
+  "tradingMode": zod.enum(['paper', 'live']).describe('Current trading mode'),
+  "dailyLossUsd": zod.number().describe('Current day realised loss in USD')
 })
 
 
@@ -134,5 +175,49 @@ export const GetStatsResponse = zod.object({
  * @summary SSE stream for real-time updates
  */
 export const GetStreamResponse = zod.unknown()
+
+
+/**
+ * Returns non-zero asset balances from the Binance account. Requires credentials and live mode.
+ * @summary Get Binance account balances
+ */
+export const GetAccountBalancesResponse = zod.object({
+  "balances": zod.array(zod.object({
+  "asset": zod.string(),
+  "free": zod.number().describe('Available balance'),
+  "locked": zod.number().describe('Balance locked in open orders'),
+  "usdtValue": zod.number().optional().describe('Estimated value in USDT (if price data available)')
+})),
+  "totalUsdtValue": zod.number().describe('Sum of estimated USDT values for all non-zero assets'),
+  "updatedAt": zod.coerce.date()
+})
+
+
+/**
+ * Returns the last 20 real orders placed by the bot. Requires credentials and live mode.
+ * @summary Get recent bot-placed orders
+ */
+export const GetAccountOrdersResponse = zod.object({
+  "orders": zod.array(zod.object({
+  "orderId": zod.number(),
+  "symbol": zod.string(),
+  "side": zod.enum(['BUY', 'SELL']),
+  "executedQty": zod.number(),
+  "avgPrice": zod.number(),
+  "status": zod.string(),
+  "timestamp": zod.coerce.date(),
+  "leg": zod.number().optional().describe('Which leg of the triangle this order was (1, 2, or 3)'),
+  "trianglePath": zod.string().optional().describe('Human-readable triangle path, e.g. USDT→BTC→ETH→USDT')
+}))
+})
+
+
+/**
+ * @summary Emergency kill switch — revert to paper mode immediately
+ */
+export const KillBotResponse = zod.object({
+  "tradingMode": zod.string(),
+  "message": zod.string()
+})
 
 

@@ -5,6 +5,7 @@
  * Triangular Arbitrage Bot API
  * OpenAPI spec version: 0.1.0
  */
+import type { PaperTradeMode } from './paperTradeMode';
 
 export interface PaperTrade {
   id: string;
@@ -17,4 +18,10 @@ export interface PaperTrade {
   grossProfitUsd: number;
   netProfitUsd: number;
   netProfitPct: number;
+  /** Whether this was a simulated or real executed trade */
+  mode?: PaperTradeMode;
+  /** Binance order IDs for each leg (live trades only) */
+  orderIds?: number[];
+  /** Actual fill prices from Binance for each leg (live trades only) */
+  fillPrices?: number[];
 }

@@ -6,14 +6,27 @@
  * OpenAPI spec version: 0.1.0
  */
 
+export * from './accountBalance';
+export * from './accountBalancesResponse';
 export * from './arbitrageOpportunity';
 export * from './botConfig';
 export * from './botConfigInput';
+export * from './botConfigInputTradingMode';
+export * from './botConfigTradingMode';
 export * from './botStats';
+export * from './botStatsTradingMode';
+export * from './credentialsInput';
+export * from './credentialsStatus';
+export * from './errorResponse';
 export * from './getOpportunitiesParams';
 export * from './getTradesParams';
 export * from './healthStatus';
+export * from './killSwitchResponse';
+export * from './liveOrder';
+export * from './liveOrderSide';
+export * from './liveOrdersResponse';
 export * from './opportunitiesResponse';
 export * from './paperTrade';
+export * from './paperTradeMode';
 export * from './topOpportunity';
 export * from './tradesResponse';

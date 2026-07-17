@@ -5,16 +5,17 @@
  * Triangular Arbitrage Bot API
  * OpenAPI spec version: 0.1.0
  */
+import type { BotStatsTradingMode } from './botStatsTradingMode';
 import type { TopOpportunity } from './topOpportunity';
 
 export interface BotStats {
   /** Total opportunities detected since start */
   totalOpportunities: number;
-  /** Total paper trades executed */
+  /** Total trades executed */
   totalTrades: number;
   /** Cumulative net P&L in USD */
   totalProfitUsd: number;
-  /** Fraction of trades that were profitable (should be 1.0 since we only trade profitable ones) */
+  /** Fraction of trades that were profitable */
   winRate: number;
   /** Number of trading pairs in the price map */
   pairsTracked: number;
@@ -32,4 +33,8 @@ export interface BotStats {
   topScan: TopOpportunity[];
   /** Top 5 best triangles seen today (since server start), by net profit */
   topToday: TopOpportunity[];
+  /** Current trading mode */
+  tradingMode: BotStatsTradingMode;
+  /** Current day realised loss in USD */
+  dailyLossUsd: number;
 }

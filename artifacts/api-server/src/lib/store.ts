@@ -4,6 +4,10 @@ export interface BotConfig {
   feeRate: number;
   minProfitThreshold: number;
   notionalSize: number;
+  tradingMode: "paper" | "live";
+  maxNotionalPerTrade: number;
+  dailyLossLimitUsd: number;
+  dailyLossUsd: number; // read-only; managed internally
 }
 
 export interface ArbitrageOpportunity {
@@ -28,6 +32,9 @@ export interface PaperTrade {
   grossProfitUsd: number;
   netProfitUsd: number;
   netProfitPct: number;
+  mode?: "paper" | "live";
+  orderIds?: number[];
+  fillPrices?: number[];
 }
 
 export interface TopOpportunity {
@@ -38,8 +45,21 @@ export interface TopOpportunity {
   timestamp: string; // ISO string
 }
 
+export interface LiveOrder {
+  orderId: number;
+  symbol: string;
+  side: "BUY" | "SELL";
+  executedQty: number;
+  avgPrice: number;
+  status: string;
+  timestamp: string; // ISO string
+  leg: number; // 1, 2, or 3
+  trianglePath: string; // "USDT→BTC→ETH→USDT"
+}
+
 const MAX_OPPORTUNITIES = 500;
 const MAX_TRADES = 500;
+const MAX_LIVE_ORDERS = 200;
 const TOP_N = 5;
 
 class Store {
@@ -47,10 +67,15 @@ class Store {
     feeRate: 0.001,
     minProfitThreshold: 0.001,
     notionalSize: 1000,
+    tradingMode: "paper",
+    maxNotionalPerTrade: 1000,
+    dailyLossLimitUsd: 50,
+    dailyLossUsd: 0,
   };
 
   opportunities: ArbitrageOpportunity[] = [];
   trades: PaperTrade[] = [];
+  liveOrders: LiveOrder[] = [];
 
   totalOpportunities = 0;
   totalTrades = 0;
@@ -65,6 +90,9 @@ class Store {
 
   // Top 5 from the current scan window — set by the scanner each broadcast
   topScan: TopOpportunity[] = [];
+
+  // Daily loss reset tracking
+  private currentDay = new Date().toDateString();
 
   // Rolling rate tracking
   private pathWindowCount = 0;
@@ -87,7 +115,24 @@ class Store {
     if (this.trades.length > MAX_TRADES) this.trades.pop();
     this.totalTrades++;
     this.totalProfitUsd += trade.netProfitUsd;
+
+    // Track daily loss for live trades
+    if (trade.mode === "live" && trade.netProfitUsd < 0) {
+      this.config.dailyLossUsd += Math.abs(trade.netProfitUsd);
+    }
+
     return full;
+  }
+
+  addLiveOrders(orders: LiveOrder[]): void {
+    this.liveOrders.unshift(...orders);
+    if (this.liveOrders.length > MAX_LIVE_ORDERS) {
+      this.liveOrders.length = MAX_LIVE_ORDERS;
+    }
+  }
+
+  getLiveOrders(limit = 20): LiveOrder[] {
+    return this.liveOrders.slice(0, limit);
   }
 
   incrementPaths(n: number): void {
@@ -102,6 +147,26 @@ class Store {
     }
   }
 
+  /** Check if the daily loss limit has been exceeded; auto-revert to paper if so. */
+  checkDailyLossLimit(): boolean {
+    // Reset at day boundary
+    const today = new Date().toDateString();
+    if (today !== this.currentDay) {
+      this.currentDay = today;
+      this.config.dailyLossUsd = 0;
+    }
+
+    if (
+      this.config.tradingMode === "live" &&
+      this.config.dailyLossLimitUsd > 0 &&
+      this.config.dailyLossUsd >= this.config.dailyLossLimitUsd
+    ) {
+      this.config.tradingMode = "paper";
+      return true; // Limit hit — caller should broadcast alert
+    }
+    return false;
+  }
+
   /** Called by the scanner with the best candidates from the last 2s window */
   setTopScan(candidates: TopOpportunity[]): void {
     // Sort descending by netProfitPct and keep top N
@@ -111,17 +176,15 @@ class Store {
 
     // Merge into topToday: insert each candidate, resort, trim
     for (const c of this.topScan) {
-      // Replace an existing entry for the same path if the new one is better
       const key = c.path.join("/");
       const existing = this.topToday.findIndex(
-        (t) => t.path.join("/") === key
+        (t) => t.path.join("/") === key,
       );
       if (existing !== -1) {
         if (c.netProfitPct > this.topToday[existing].netProfitPct) {
           this.topToday[existing] = c;
         }
       } else {
-        // Only add if it would make the top N, or we have fewer than N
         if (
           this.topToday.length < TOP_N ||
           c.netProfitPct > this.topToday[this.topToday.length - 1].netProfitPct
@@ -152,6 +215,8 @@ class Store {
       opportunitiesPerMinute: this.oppTimestamps.length,
       topScan: this.topScan,
       topToday: this.topToday,
+      tradingMode: this.config.tradingMode,
+      dailyLossUsd: this.config.dailyLossUsd,
     };
   }
 }

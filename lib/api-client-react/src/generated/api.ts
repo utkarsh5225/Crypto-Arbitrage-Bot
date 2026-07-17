@@ -20,12 +20,18 @@ import type {
 } from '@tanstack/react-query';
 
 import type {
+  AccountBalancesResponse,
   BotConfig,
   BotConfigInput,
   BotStats,
+  CredentialsInput,
+  CredentialsStatus,
+  ErrorResponse,
   GetOpportunitiesParams,
   GetTradesParams,
   HealthStatus,
+  KillSwitchResponse,
+  LiveOrdersResponse,
   OpportunitiesResponse,
   TradesResponse
 } from './api.schemas';
@@ -284,6 +290,156 @@ export const useUpdateConfig = <TError = ErrorType<unknown>,
       return useMutation(getUpdateConfigMutationOptions(options));
     }
 
+export const getGetCredentialsUrl = () => {
+
+
+
+
+  return `/api/config/credentials`
+}
+
+/**
+ * Returns whether credentials are configured; never returns the actual key/secret values
+ * @summary Get Binance API credential status
+ */
+export const getCredentials = async ( options?: RequestInit): Promise<CredentialsStatus> => {
+
+  return customFetch<CredentialsStatus>(getGetCredentialsUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetCredentialsQueryKey = () => {
+    return [
+    `/api/config/credentials`
+    ] as const;
+    }
+
+
+export const getGetCredentialsQueryOptions = <TData = Awaited<ReturnType<typeof getCredentials>>, TError = ErrorType<unknown>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getCredentials>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetCredentialsQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getCredentials>>> = ({ signal }) => getCredentials({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getCredentials>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetCredentialsQueryResult = NonNullable<Awaited<ReturnType<typeof getCredentials>>>
+export type GetCredentialsQueryError = ErrorType<unknown>
+
+
+/**
+ * @summary Get Binance API credential status
+ */
+
+export function useGetCredentials<TData = Awaited<ReturnType<typeof getCredentials>>, TError = ErrorType<unknown>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getCredentials>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetCredentialsQueryOptions(options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getSetCredentialsUrl = () => {
+
+
+
+
+  return `/api/config/credentials`
+}
+
+/**
+ * Stores the API key and secret securely on the server
+ * @summary Save Binance API credentials
+ */
+export const setCredentials = async (credentialsInput: CredentialsInput, options?: RequestInit): Promise<CredentialsStatus> => {
+
+  return customFetch<CredentialsStatus>(getSetCredentialsUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(credentialsInput)
+  }
+);}
+
+
+
+
+
+export const getSetCredentialsMutationOptions = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof setCredentials>>, TError,{data: BodyType<CredentialsInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof setCredentials>>, TError,{data: BodyType<CredentialsInput>}, TContext> => {
+
+const mutationKey = ['setCredentials'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof setCredentials>>, {data: BodyType<CredentialsInput>}> = (props) => {
+          const {data} = props ?? {};
+
+          return  setCredentials(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type SetCredentialsMutationResult = NonNullable<Awaited<ReturnType<typeof setCredentials>>>
+    export type SetCredentialsMutationBody = BodyType<CredentialsInput>
+    export type SetCredentialsMutationError = ErrorType<unknown>
+
+    /**
+ * @summary Save Binance API credentials
+ */
+export const useSetCredentials = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof setCredentials>>, TError,{data: BodyType<CredentialsInput>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof setCredentials>>,
+        TError,
+        {data: BodyType<CredentialsInput>},
+        TContext
+      > => {
+      return useMutation(getSetCredentialsMutationOptions(options));
+    }
+
 export const getGetOpportunitiesUrl = (params?: GetOpportunitiesParams,) => {
   const normalizedParams = new URLSearchParams();
 
@@ -384,7 +540,7 @@ export const getGetTradesUrl = (params?: GetTradesParams,) => {
 }
 
 /**
- * @summary Get paper trade history
+ * @summary Get trade history
  */
 export const getTrades = async (params?: GetTradesParams, options?: RequestInit): Promise<TradesResponse> => {
 
@@ -431,7 +587,7 @@ export type GetTradesQueryError = ErrorType<unknown>
 
 
 /**
- * @summary Get paper trade history
+ * @summary Get trade history
  */
 
 export function useGetTrades<TData = Awaited<ReturnType<typeof getTrades>>, TError = ErrorType<unknown>>(
@@ -606,4 +762,231 @@ export function useGetStream<TData = Awaited<ReturnType<typeof getStream>>, TErr
 
 
 
+
+export const getGetAccountBalancesUrl = () => {
+
+
+
+
+  return `/api/account/balances`
+}
+
+/**
+ * Returns non-zero asset balances from the Binance account. Requires credentials and live mode.
+ * @summary Get Binance account balances
+ */
+export const getAccountBalances = async ( options?: RequestInit): Promise<AccountBalancesResponse> => {
+
+  return customFetch<AccountBalancesResponse>(getGetAccountBalancesUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetAccountBalancesQueryKey = () => {
+    return [
+    `/api/account/balances`
+    ] as const;
+    }
+
+
+export const getGetAccountBalancesQueryOptions = <TData = Awaited<ReturnType<typeof getAccountBalances>>, TError = ErrorType<ErrorResponse>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getAccountBalances>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetAccountBalancesQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getAccountBalances>>> = ({ signal }) => getAccountBalances({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getAccountBalances>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetAccountBalancesQueryResult = NonNullable<Awaited<ReturnType<typeof getAccountBalances>>>
+export type GetAccountBalancesQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary Get Binance account balances
+ */
+
+export function useGetAccountBalances<TData = Awaited<ReturnType<typeof getAccountBalances>>, TError = ErrorType<ErrorResponse>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getAccountBalances>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetAccountBalancesQueryOptions(options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getGetAccountOrdersUrl = () => {
+
+
+
+
+  return `/api/account/orders`
+}
+
+/**
+ * Returns the last 20 real orders placed by the bot. Requires credentials and live mode.
+ * @summary Get recent bot-placed orders
+ */
+export const getAccountOrders = async ( options?: RequestInit): Promise<LiveOrdersResponse> => {
+
+  return customFetch<LiveOrdersResponse>(getGetAccountOrdersUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetAccountOrdersQueryKey = () => {
+    return [
+    `/api/account/orders`
+    ] as const;
+    }
+
+
+export const getGetAccountOrdersQueryOptions = <TData = Awaited<ReturnType<typeof getAccountOrders>>, TError = ErrorType<ErrorResponse>>( options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getAccountOrders>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetAccountOrdersQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getAccountOrders>>> = ({ signal }) => getAccountOrders({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getAccountOrders>>, TError, TData> & { queryKey: QueryKey }
+}
+
+export type GetAccountOrdersQueryResult = NonNullable<Awaited<ReturnType<typeof getAccountOrders>>>
+export type GetAccountOrdersQueryError = ErrorType<ErrorResponse>
+
+
+/**
+ * @summary Get recent bot-placed orders
+ */
+
+export function useGetAccountOrders<TData = Awaited<ReturnType<typeof getAccountOrders>>, TError = ErrorType<ErrorResponse>>(
+  options?: { query?:UseQueryOptions<Awaited<ReturnType<typeof getAccountOrders>>, TError, TData>, request?: SecondParameter<typeof customFetch>}
+
+ ):  UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+
+  const queryOptions = getGetAccountOrdersQueryOptions(options)
+
+  const query = useQuery(queryOptions) as  UseQueryResult<TData, TError> & { queryKey: QueryKey };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getKillBotUrl = () => {
+
+
+
+
+  return `/api/bot/kill`
+}
+
+/**
+ * @summary Emergency kill switch — revert to paper mode immediately
+ */
+export const killBot = async ( options?: RequestInit): Promise<KillSwitchResponse> => {
+
+  return customFetch<KillSwitchResponse>(getKillBotUrl(),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getKillBotMutationOptions = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof killBot>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof killBot>>, TError,void, TContext> => {
+
+const mutationKey = ['killBot'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof killBot>>, void> = () => {
+
+
+          return  killBot(requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type KillBotMutationResult = NonNullable<Awaited<ReturnType<typeof killBot>>>
+
+    export type KillBotMutationError = ErrorType<unknown>
+
+    /**
+ * @summary Emergency kill switch — revert to paper mode immediately
+ */
+export const useKillBot = <TError = ErrorType<unknown>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof killBot>>, TError,void, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof killBot>>,
+        TError,
+        void,
+        TContext
+      > => {
+      return useMutation(getKillBotMutationOptions(options));
+    }
 

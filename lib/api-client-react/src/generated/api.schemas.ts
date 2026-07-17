@@ -9,19 +9,63 @@ export interface HealthStatus {
   status: string;
 }
 
+/**
+ * Whether to paper-trade or execute real orders on Binance
+ */
+export type BotConfigTradingMode = typeof BotConfigTradingMode[keyof typeof BotConfigTradingMode];
+
+
+export const BotConfigTradingMode = {
+  paper: 'paper',
+  live: 'live',
+} as const;
+
 export interface BotConfig {
   /** Fee per trade leg as a decimal (e.g. 0.001 = 0.1%) */
   feeRate: number;
-  /** Minimum net profit % to trigger paper trade (e.g. 0.001 = 0.1%) */
+  /** Minimum net profit % to trigger trade (e.g. 0.001 = 0.1%) */
   minProfitThreshold: number;
   /** Fixed notional trade size in USDT */
   notionalSize: number;
+  /** Whether to paper-trade or execute real orders on Binance */
+  tradingMode: BotConfigTradingMode;
+  /** Maximum USDT notional per live trade (safety cap) */
+  maxNotionalPerTrade: number;
+  /** Revert to paper mode if realised daily loss exceeds this value */
+  dailyLossLimitUsd: number;
+  /** Current day realised loss in USD (read-only, set by server) */
+  dailyLossUsd: number;
 }
+
+export type BotConfigInputTradingMode = typeof BotConfigInputTradingMode[keyof typeof BotConfigInputTradingMode];
+
+
+export const BotConfigInputTradingMode = {
+  paper: 'paper',
+  live: 'live',
+} as const;
 
 export interface BotConfigInput {
   feeRate?: number;
   minProfitThreshold?: number;
   notionalSize?: number;
+  tradingMode?: BotConfigInputTradingMode;
+  maxNotionalPerTrade?: number;
+  dailyLossLimitUsd?: number;
+}
+
+export interface CredentialsInput {
+  /** Binance API key */
+  apiKey: string;
+  /** Binance API secret */
+  apiSecret: string;
+}
+
+export interface CredentialsStatus {
+  /** Whether credentials are currently set */
+  configured: boolean;
+  /** Masked API key for display (first 4 + last 4 chars only) */
+  maskedKey?: string;
 }
 
 export interface ArbitrageOpportunity {
@@ -45,6 +89,17 @@ export interface OpportunitiesResponse {
   total: number;
 }
 
+/**
+ * Whether this was a simulated or real executed trade
+ */
+export type PaperTradeMode = typeof PaperTradeMode[keyof typeof PaperTradeMode];
+
+
+export const PaperTradeMode = {
+  paper: 'paper',
+  live: 'live',
+} as const;
+
 export interface PaperTrade {
   id: string;
   opportunityId: string;
@@ -56,11 +111,69 @@ export interface PaperTrade {
   grossProfitUsd: number;
   netProfitUsd: number;
   netProfitPct: number;
+  /** Whether this was a simulated or real executed trade */
+  mode?: PaperTradeMode;
+  /** Binance order IDs for each leg (live trades only) */
+  orderIds?: number[];
+  /** Actual fill prices from Binance for each leg (live trades only) */
+  fillPrices?: number[];
 }
 
 export interface TradesResponse {
   data: PaperTrade[];
   total: number;
+}
+
+export interface AccountBalance {
+  asset: string;
+  /** Available balance */
+  free: number;
+  /** Balance locked in open orders */
+  locked: number;
+  /** Estimated value in USDT (if price data available) */
+  usdtValue?: number;
+}
+
+export interface AccountBalancesResponse {
+  balances: AccountBalance[];
+  /** Sum of estimated USDT values for all non-zero assets */
+  totalUsdtValue: number;
+  updatedAt: string;
+}
+
+export type LiveOrderSide = typeof LiveOrderSide[keyof typeof LiveOrderSide];
+
+
+export const LiveOrderSide = {
+  BUY: 'BUY',
+  SELL: 'SELL',
+} as const;
+
+export interface LiveOrder {
+  orderId: number;
+  symbol: string;
+  side: LiveOrderSide;
+  executedQty: number;
+  avgPrice: number;
+  status: string;
+  timestamp: string;
+  /** Which leg of the triangle this order was (1, 2, or 3) */
+  leg?: number;
+  /** Human-readable triangle path, e.g. USDT→BTC→ETH→USDT */
+  trianglePath?: string;
+}
+
+export interface LiveOrdersResponse {
+  orders: LiveOrder[];
+}
+
+export interface KillSwitchResponse {
+  tradingMode: string;
+  message: string;
+}
+
+export interface ErrorResponse {
+  error: string;
 }
 
 /**
@@ -78,14 +191,25 @@ export interface TopOpportunity {
   timestamp: string;
 }
 
+/**
+ * Current trading mode
+ */
+export type BotStatsTradingMode = typeof BotStatsTradingMode[keyof typeof BotStatsTradingMode];
+
+
+export const BotStatsTradingMode = {
+  paper: 'paper',
+  live: 'live',
+} as const;
+
 export interface BotStats {
   /** Total opportunities detected since start */
   totalOpportunities: number;
-  /** Total paper trades executed */
+  /** Total trades executed */
   totalTrades: number;
   /** Cumulative net P&L in USD */
   totalProfitUsd: number;
-  /** Fraction of trades that were profitable (should be 1.0 since we only trade profitable ones) */
+  /** Fraction of trades that were profitable */
   winRate: number;
   /** Number of trading pairs in the price map */
   pairsTracked: number;
@@ -103,6 +227,10 @@ export interface BotStats {
   topScan: TopOpportunity[];
   /** Top 5 best triangles seen today (since server start), by net profit */
   topToday: TopOpportunity[];
+  /** Current trading mode */
+  tradingMode: BotStatsTradingMode;
+  /** Current day realised loss in USD */
+  dailyLossUsd: number;
 }
 
 export type GetOpportunitiesParams = {

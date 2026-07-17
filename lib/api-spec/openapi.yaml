@@ -15,11 +15,15 @@ tags:
   - name: opportunities
     description: Arbitrage opportunity history
   - name: trades
-    description: Paper trade history
+    description: Trade history
   - name: stats
     description: Aggregated statistics
   - name: stream
     description: Server-sent events stream
+  - name: account
+    description: Live Binance account data
+  - name: bot
+    description: Bot control operations
 
 paths:
   /healthz:
@@ -67,6 +71,38 @@ paths:
               schema:
                 $ref: "#/components/schemas/BotConfig"
 
+  /config/credentials:
+    get:
+      operationId: getCredentials
+      tags: [config]
+      summary: Get Binance API credential status
+      description: Returns whether credentials are configured; never returns the actual key/secret values
+      responses:
+        "200":
+          description: Credential status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CredentialsStatus"
+    post:
+      operationId: setCredentials
+      tags: [config]
+      summary: Save Binance API credentials
+      description: Stores the API key and secret securely on the server
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CredentialsInput"
+      responses:
+        "200":
+          description: Credential status after saving
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CredentialsStatus"
+
   /opportunities:
     get:
       operationId: getOpportunities
@@ -97,7 +133,7 @@ paths:
     get:
       operationId: getTrades
       tags: [trades]
-      summary: Get paper trade history
+      summary: Get trade history
       parameters:
         - name: limit
           in: query
@@ -113,7 +149,7 @@ paths:
           description: Pagination offset
       responses:
         "200":
-          description: List of paper trades
+          description: List of trades
           content:
             application/json:
               schema:
@@ -146,6 +182,59 @@ paths:
               schema:
                 type: string
 
+  /account/balances:
+    get:
+      operationId: getAccountBalances
+      tags: [account]
+      summary: Get Binance account balances
+      description: Returns non-zero asset balances from the Binance account. Requires credentials and live mode.
+      responses:
+        "200":
+          description: Account balances
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBalancesResponse"
+        "403":
+          description: Credentials not configured or not in live mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /account/orders:
+    get:
+      operationId: getAccountOrders
+      tags: [account]
+      summary: Get recent bot-placed orders
+      description: Returns the last 20 real orders placed by the bot. Requires credentials and live mode.
+      responses:
+        "200":
+          description: Recent bot orders
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveOrdersResponse"
+        "403":
+          description: Credentials not configured or not in live mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /bot/kill:
+    post:
+      operationId: killBot
+      tags: [bot]
+      summary: Emergency kill switch — revert to paper mode immediately
+      responses:
+        "200":
+          description: Bot reverted to paper mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KillSwitchResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -164,14 +253,31 @@ components:
           description: Fee per trade leg as a decimal (e.g. 0.001 = 0.1%)
         minProfitThreshold:
           type: number
-          description: Minimum net profit % to trigger paper trade (e.g. 0.001 = 0.1%)
+          description: Minimum net profit % to trigger trade (e.g. 0.001 = 0.1%)
         notionalSize:
           type: number
           description: Fixed notional trade size in USDT
+        tradingMode:
+          type: string
+          enum: [paper, live]
+          description: Whether to paper-trade or execute real orders on Binance
+        maxNotionalPerTrade:
+          type: number
+          description: Maximum USDT notional per live trade (safety cap)
+        dailyLossLimitUsd:
+          type: number
+          description: Revert to paper mode if realised daily loss exceeds this value
+        dailyLossUsd:
+          type: number
+          description: Current day realised loss in USD (read-only, set by server)
       required:
         - feeRate
         - minProfitThreshold
         - notionalSize
+        - tradingMode
+        - maxNotionalPerTrade
+        - dailyLossLimitUsd
+        - dailyLossUsd
 
     BotConfigInput:
       type: object
@@ -182,6 +288,38 @@ components:
           type: number
         notionalSize:
           type: number
+        tradingMode:
+          type: string
+          enum: [paper, live]
+        maxNotionalPerTrade:
+          type: number
+        dailyLossLimitUsd:
+          type: number
+
+    CredentialsInput:
+      type: object
+      properties:
+        apiKey:
+          type: string
+          description: Binance API key
+        apiSecret:
+          type: string
+          description: Binance API secret
+      required:
+        - apiKey
+        - apiSecret
+
+    CredentialsStatus:
+      type: object
+      properties:
+        configured:
+          type: boolean
+          description: Whether credentials are currently set
+        maskedKey:
+          type: string
+          description: Masked API key for display (first 4 + last 4 chars only)
+      required:
+        - configured
 
     ArbitrageOpportunity:
       type: object
@@ -267,6 +405,20 @@ components:
           type: number
         netProfitPct:
           type: number
+        mode:
+          type: string
+          enum: [paper, live]
+          description: Whether this was a simulated or real executed trade
+        orderIds:
+          type: array
+          items:
+            type: integer
+          description: Binance order IDs for each leg (live trades only)
+        fillPrices:
+          type: array
+          items:
+            type: number
+          description: Actual fill prices from Binance for each leg (live trades only)
       required:
         - id
         - opportunityId
@@ -291,6 +443,106 @@ components:
       required:
         - data
         - total
+
+    AccountBalance:
+      type: object
+      properties:
+        asset:
+          type: string
+        free:
+          type: number
+          description: Available balance
+        locked:
+          type: number
+          description: Balance locked in open orders
+        usdtValue:
+          type: number
+          description: Estimated value in USDT (if price data available)
+      required:
+        - asset
+        - free
+        - locked
+
+    AccountBalancesResponse:
+      type: object
+      properties:
+        balances:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountBalance"
+        totalUsdtValue:
+          type: number
+          description: Sum of estimated USDT values for all non-zero assets
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - balances
+        - totalUsdtValue
+        - updatedAt
+
+    LiveOrder:
+      type: object
+      properties:
+        orderId:
+          type: integer
+        symbol:
+          type: string
+        side:
+          type: string
+          enum: [BUY, SELL]
+        executedQty:
+          type: number
+        avgPrice:
+          type: number
+        status:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        leg:
+          type: integer
+          description: Which leg of the triangle this order was (1, 2, or 3)
+        trianglePath:
+          type: string
+          description: Human-readable triangle path, e.g. USDT→BTC→ETH→USDT
+      required:
+        - orderId
+        - symbol
+        - side
+        - executedQty
+        - avgPrice
+        - status
+        - timestamp
+
+    LiveOrdersResponse:
+      type: object
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: "#/components/schemas/LiveOrder"
+      required:
+        - orders
+
+    KillSwitchResponse:
+      type: object
+      properties:
+        tradingMode:
+          type: string
+        message:
+          type: string
+      required:
+        - tradingMode
+        - message
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
 
     TopOpportunity:
       type: object
@@ -330,13 +582,13 @@ components:
           description: Total opportunities detected since start
         totalTrades:
           type: integer
-          description: Total paper trades executed
+          description: Total trades executed
         totalProfitUsd:
           type: number
           description: Cumulative net P&L in USD
         winRate:
           type: number
-          description: Fraction of trades that were profitable (should be 1.0 since we only trade profitable ones)
+          description: Fraction of trades that were profitable
         pairsTracked:
           type: integer
           description: Number of trading pairs in the price map
@@ -365,6 +617,13 @@ components:
           items:
             $ref: "#/components/schemas/TopOpportunity"
           description: Top 5 best triangles seen today (since server start), by net profit
+        tradingMode:
+          type: string
+          enum: [paper, live]
+          description: Current trading mode
+        dailyLossUsd:
+          type: number
+          description: Current day realised loss in USD
       required:
         - totalOpportunities
         - totalTrades
@@ -378,3 +637,5 @@ components:
         - opportunitiesPerMinute
         - topScan
         - topToday
+        - tradingMode
+        - dailyLossUsd

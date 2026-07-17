@@ -5,12 +5,21 @@
  * Triangular Arbitrage Bot API
  * OpenAPI spec version: 0.1.0
  */
+import type { BotConfigTradingMode } from './botConfigTradingMode';
 
 export interface BotConfig {
   /** Fee per trade leg as a decimal (e.g. 0.001 = 0.1%) */
   feeRate: number;
-  /** Minimum net profit % to trigger paper trade (e.g. 0.001 = 0.1%) */
+  /** Minimum net profit % to trigger trade (e.g. 0.001 = 0.1%) */
   minProfitThreshold: number;
   /** Fixed notional trade size in USDT */
   notionalSize: number;
+  /** Whether to paper-trade or execute real orders on Binance */
+  tradingMode: BotConfigTradingMode;
+  /** Maximum USDT notional per live trade (safety cap) */
+  maxNotionalPerTrade: number;
+  /** Revert to paper mode if realised daily loss exceeds this value */
+  dailyLossLimitUsd: number;
+  /** Current day realised loss in USD (read-only, set by server) */
+  dailyLossUsd: number;
 }

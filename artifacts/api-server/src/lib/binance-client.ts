@@ -1,0 +1,175 @@
+/**
+ * Minimal signed Binance REST API client.
+ *
+ * Signing contract (Binance docs §Authentication):
+ *   signature = HMAC-SHA256(secret, totalParams)
+ *   totalParams = all query-string parameters concatenated in the order they
+ *                 appear, INCLUDING timestamp and recvWindow.
+ *
+ * For POST endpoints (e.g. POST /api/v3/order) Binance accepts all parameters
+ * as query-string fields — no request body required. We send everything in the
+ * query string so the signed canonical string is unambiguous and matches what
+ * the server receives byte-for-byte.
+ */
+
+import crypto from "crypto";
+import { logger } from "./logger";
+
+const BASE_URL = "https://api.binance.com";
+const RECV_WINDOW = 5000;
+
+export interface BinanceFill {
+  price: string;
+  qty: string;
+  commission: string;
+  commissionAsset: string;
+}
+
+export interface BinanceOrderResult {
+  orderId: number;
+  symbol: string;
+  side: "BUY" | "SELL";
+  status: string;
+  executedQty: string;
+  cummulativeQuoteQty: string; // note: Binance typo is intentional
+  fills: BinanceFill[];
+  transactTime: number;
+}
+
+export interface BinanceBalance {
+  asset: string;
+  free: string;
+  locked: string;
+}
+
+export interface BinanceAccount {
+  balances: BinanceBalance[];
+  canTrade: boolean;
+}
+
+export class BinanceClient {
+  constructor(
+    private readonly apiKey: string,
+    private readonly apiSecret: string,
+  ) {}
+
+  /** HMAC-SHA256 of the canonical query string. */
+  private sign(canonicalString: string): string {
+    return crypto
+      .createHmac("sha256", this.apiSecret)
+      .update(canonicalString)
+      .digest("hex");
+  }
+
+  /**
+   * Issue a signed request.
+   *
+   * ALL parameters (including those that would logically be a POST body) are
+   * placed in the query string so the canonical string sent to HMAC exactly
+   * matches the parameters Binance sees.  The request body is always empty.
+   */
+  private async request<T>(
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    params: Record<string, string | number> = {},
+  ): Promise<T> {
+    const allParams: Record<string, string | number> = {
+      ...params,
+      timestamp: Date.now(),
+      recvWindow: RECV_WINDOW,
+    };
+
+    // Build canonical query string — preserve insertion order so the signature
+    // covers the string in exactly the order we'll append it to the URL.
+    const canonicalQS = Object.entries(allParams)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join("&");
+
+    const signature = this.sign(canonicalQS);
+    const url = `${BASE_URL}${path}?${canonicalQS}&signature=${signature}`;
+
+    logger.debug({ method, path, params: Object.keys(allParams) }, "Binance API request");
+
+    const res = await fetch(url, {
+      method,
+      headers: {
+        "X-MBX-APIKEY": this.apiKey,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    const text = await res.text();
+
+    if (!res.ok) {
+      logger.error({ status: res.status, body: text, path }, "Binance API error");
+      throw new Error(`Binance ${res.status}: ${text}`);
+    }
+
+    return JSON.parse(text) as T;
+  }
+
+  /**
+   * Place a MARKET order.
+   *
+   * For BUY legs:  pass { quoteOrderQty }  — spend this many quote units (e.g. USDT)
+   * For SELL legs: pass { quantity }       — sell this many base units (e.g. BTC)
+   *
+   * Binance returns executedQty (base received/sold) and cummulativeQuoteQty
+   * (quote spent/received).  live-execution.ts uses these to thread the
+   * running balance through the 3 legs.
+   */
+  async placeMarketOrder(
+    symbol: string,
+    side: "BUY" | "SELL",
+    qty: { quoteOrderQty: number } | { quantity: number },
+  ): Promise<BinanceOrderResult> {
+    const params: Record<string, string | number> = {
+      symbol,
+      side,
+      type: "MARKET",
+    };
+
+    if ("quoteOrderQty" in qty) {
+      // Precision is already applied by the caller (live-execution.ts roundQuote).
+      // Pass the value as-is; additional rounding here would override symbol-specific
+      // quotePrecision and corrupt non-USDT quote amounts.
+      params["quoteOrderQty"] = qty.quoteOrderQty;
+    } else {
+      // Precision is already applied by the caller (live-execution.ts roundToStep).
+      params["quantity"] = qty.quantity;
+    }
+
+    return this.request<BinanceOrderResult>("POST", "/api/v3/order", params);
+  }
+
+  /**
+   * Fetch account information including non-zero balances.
+   * Also used by testCredentials() to validate the key/secret pair.
+   */
+  async getAccount(): Promise<BinanceAccount> {
+    return this.request<BinanceAccount>("GET", "/api/v3/account");
+  }
+
+  /**
+   * Returns true when the key/secret can successfully authenticate.
+   * A rejected 401/403 response returns false; network errors propagate.
+   */
+  async testCredentials(): Promise<boolean> {
+    try {
+      const account = await this.getAccount();
+      return account.canTrade;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Only treat auth failures as "invalid credentials" — don't swallow network errors
+      if (msg.includes("401") || msg.includes("403") || msg.includes("-2014") || msg.includes("-2015")) {
+        return false;
+      }
+      throw err;
+    }
+  }
+}
+
+/** Factory: builds a BinanceClient from the provided credentials. */
+export function createClient(apiKey: string, apiSecret: string): BinanceClient {
+  return new BinanceClient(apiKey, apiSecret);
+}

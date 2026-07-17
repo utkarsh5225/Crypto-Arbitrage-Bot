@@ -5,9 +5,13 @@
  * Triangular Arbitrage Bot API
  * OpenAPI spec version: 0.1.0
  */
+import type { BotConfigInputTradingMode } from './botConfigInputTradingMode';
 
 export interface BotConfigInput {
   feeRate?: number;
   minProfitThreshold?: number;
   notionalSize?: number;
+  tradingMode?: BotConfigInputTradingMode;
+  maxNotionalPerTrade?: number;
+  dailyLossLimitUsd?: number;
 }

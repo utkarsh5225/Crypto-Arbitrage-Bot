@@ -2,6 +2,8 @@ import WebSocket from "ws";
 import { logger } from "./logger";
 import { store, type TopOpportunity } from "./store";
 import { sseManager } from "./sse-manager";
+import { getCredentials } from "./credentials";
+import { executeLiveTrade } from "./live-execution";
 
 interface PriceEntry {
   bid: number;
@@ -12,6 +14,33 @@ interface TradingPair {
   symbol: string;
   baseAsset: string;
   quoteAsset: string;
+}
+
+/**
+ * Per-symbol filter data extracted from Binance exchange info.
+ * Used by live-execution.ts to apply correct quantity precision for each leg.
+ */
+export interface SymbolFilters {
+  /** Decimal places for the quote asset (used for quoteOrderQty in BUY orders). */
+  quotePrecision: number;
+  /** Decimal places for the base asset quantity (used for quantity in SELL orders). */
+  basePrecision: number;
+  /**
+   * Step size for base quantity from MARKET_LOT_SIZE (or LOT_SIZE fallback).
+   * 0 means no constraint beyond basePrecision.
+   */
+  lotStepSize: number;
+}
+
+const symbolFilters = new Map<string, SymbolFilters>();
+
+/**
+ * Returns precision/lot-size filters for a symbol.
+ * Falls back to conservative defaults (8/8 decimal, no step) if the symbol
+ * was not found in exchange info.
+ */
+export function getSymbolFilters(symbol: string): SymbolFilters {
+  return symbolFilters.get(symbol) ?? { quotePrecision: 8, basePrecision: 8, lotStepSize: 0 };
 }
 
 interface Triangle {
@@ -29,10 +58,13 @@ interface Triangle {
 
 const BASE_CURRENCIES = ["USDT", "BTC", "ETH", "BNB"] as const;
 // The all-symbols !bookTicker stream is silently blocked on shared IPs.
-// Instead, open multiple WS connections each subscribing to ≤500 symbols.
+// Instead, open multiple WS connections each subscribing to ≤200 symbols.
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws";
 const BINANCE_EXCHANGE_URL = "https://api.binance.com/api/v3/exchangeInfo";
 const MAX_SYMBOLS_PER_CONNECTION = 200; // 247 stayed stable; 500 gets dropped — keep well under that
+
+// Cooldown: don't trade the same triangle within this window to avoid rapid-fire doubles
+const TRADE_COOLDOWN_MS = 5_000;
 
 const priceMap = new Map<string, PriceEntry>();
 let symbolToTriangles = new Map<string, Triangle[]>();
@@ -40,6 +72,30 @@ let exchangeInfoLoaded = false;
 
 let wsConns: WebSocket[] = [];
 let reconnectTimer: NodeJS.Timeout | null = null;
+
+/** Per-triangle cooldown: path key → last traded timestamp */
+const recentlyTraded = new Map<string, number>();
+
+// ---------------------------------------------------------------------------
+// Public helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a map of asset → USDT mid-price for all XUSDT pairs currently tracked.
+ * Used by the account balances route to estimate portfolio value.
+ */
+export function getUsdtPrices(): Map<string, number> {
+  const result = new Map<string, number>();
+  result.set("USDT", 1);
+  for (const [symbol, entry] of priceMap) {
+    if (symbol.endsWith("USDT") && !symbol.startsWith("USDT")) {
+      const asset = symbol.slice(0, -4);
+      const mid = (entry.bid + entry.ask) / 2;
+      if (mid > 0) result.set(asset, mid);
+    }
+  }
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // Triangle building
@@ -69,7 +125,6 @@ function buildIndex(pairs: TradingPair[]): Map<string, Triangle[]> {
   for (const start of BASE_CURRENCIES) {
     for (const p1 of adj.get(start) ?? []) {
       const mid = p1.baseAsset === start ? p1.quoteAsset : p1.baseAsset;
-      // buy1: we go start → mid; true if mid is the base of p1 (we buy mid)
       const buy1 = p1.baseAsset === mid;
 
       for (const p2 of adj.get(mid) ?? []) {
@@ -77,19 +132,15 @@ function buildIndex(pairs: TradingPair[]): Map<string, Triangle[]> {
         const end = p2.baseAsset === mid ? p2.quoteAsset : p2.baseAsset;
         if (end === start || end === mid) continue;
 
-        // Closing leg: end → start
         const p3 =
           lookup.get(`${end}/${start}`) ?? lookup.get(`${start}/${end}`);
         if (!p3 || p3.symbol === p1.symbol || p3.symbol === p2.symbol) continue;
 
-        // Deduplicate by ordered path (we already iterate all start/mid/end combos)
         const key = `${start}/${mid}/${end}`;
         if (seen.has(key)) continue;
         seen.add(key);
 
-        // buy2: we go mid → end; true if end is the base of p2
         const buy2 = p2.baseAsset === end;
-        // buy3: we go end → start; true if start is the base of p3
         const buy3 = p3.baseAsset === start;
 
         const tri: Triangle = {
@@ -127,11 +178,9 @@ function evalTriangle(
     if (!entry || entry.ask === 0 || entry.bid === 0) return null;
 
     if (tri.buys[i]) {
-      // Buying base with quote currency: pay ask
       prices.push(entry.ask);
       amount /= entry.ask;
     } else {
-      // Selling base for quote currency: receive bid
       prices.push(entry.bid);
       amount *= entry.bid;
     }
@@ -147,7 +196,6 @@ function evalTriangle(
 // ---------------------------------------------------------------------------
 
 // Tracks the best result per triangle path within the current 2-second window.
-// Keyed by "START/MID/END" (the deduplicated triangle key).
 const windowCandidates = new Map<string, TopOpportunity>();
 
 function checkSymbol(symbol: string): void {
@@ -176,10 +224,92 @@ function checkSymbol(symbol: string): void {
       });
     }
 
-    // ── Paper-trade only when profitable ────────────────────────────────────
+    // ── Below threshold — skip trade execution ───────────────────────────────
     if (result.netPct < minProfitThreshold) continue;
 
-    // Record opportunity
+    // ── Per-path cooldown ────────────────────────────────────────────────────
+    const lastTraded = recentlyTraded.get(pathKey) ?? 0;
+    if (Date.now() - lastTraded < TRADE_COOLDOWN_MS) continue;
+
+    // ── Live mode ────────────────────────────────────────────────────────────
+    if (store.config.tradingMode === "live") {
+      const creds = getCredentials();
+
+      // Only USDT-starting triangles are supported for live trading
+      if (!creds || tri.path[0] !== "USDT") continue;
+
+      // Check / enforce daily loss limit before firing
+      if (store.checkDailyLossLimit()) {
+        logger.warn("Daily loss limit reached — reverted to paper mode");
+        sseManager.broadcast("stats", store.getStats());
+        // tradingMode is now 'paper'; fall through to paper logic below
+      } else {
+        // Mark cooldown and record opportunity before async execution
+        recentlyTraded.set(pathKey, Date.now());
+        const opp = store.addOpportunity({
+          timestamp: new Date(),
+          path: [...tri.path],
+          symbols: [...tri.symbols],
+          prices: result.prices,
+          grossProfitPct: result.grossPct,
+          netProfitPct: result.netPct,
+          wasPaperTraded: false,
+        });
+
+        const tradeNotional = Math.min(notionalSize, store.config.maxNotionalPerTrade);
+
+        // Fire live trade asynchronously — never block the WS message handler
+        executeLiveTrade(tri, opp.id, tradeNotional, creds.apiKey, creds.apiSecret)
+          .then((liveResult) => {
+            const trade = store.addTrade({
+              opportunityId: opp.id,
+              timestamp: new Date(),
+              path: [...tri.path],
+              symbols: [...tri.symbols],
+              prices: liveResult.fillPrices,
+              notionalSize: tradeNotional,
+              grossProfitUsd: liveResult.netProfitUsd, // can't separate gross/net after fills
+              netProfitUsd: liveResult.netProfitUsd,
+              netProfitPct: liveResult.netProfitPct,
+              mode: "live",
+              orderIds: liveResult.orderIds,
+              fillPrices: liveResult.fillPrices,
+            });
+
+            store.addLiveOrders(liveResult.liveOrders);
+            opp.wasPaperTraded = true;
+
+            // Re-check loss limit after trade settles
+            if (store.checkDailyLossLimit()) {
+              logger.warn("Daily loss limit hit after trade — reverted to paper mode");
+              sseManager.broadcast("stats", store.getStats());
+            }
+
+            sseManager.broadcast("opportunity", {
+              ...opp,
+              timestamp: opp.timestamp.toISOString(),
+            });
+            sseManager.broadcast("trade", {
+              ...trade,
+              timestamp: trade.timestamp.toISOString(),
+            });
+          })
+          .catch((err) => {
+            logger.error({ err, path: tri.path.join("→") }, "Live trade failed");
+            // Broadcast the opportunity even on failure so user can see it was spotted
+            sseManager.broadcast("opportunity", {
+              ...opp,
+              timestamp: opp.timestamp.toISOString(),
+            });
+          });
+
+        continue; // Do not fall through to paper trade
+      }
+    }
+
+    // ── Paper mode ───────────────────────────────────────────────────────────
+    recentlyTraded.set(pathKey, Date.now());
+
     const opp = store.addOpportunity({
       timestamp: new Date(),
       path: [...tri.path],
@@ -190,7 +320,6 @@ function checkSymbol(symbol: string): void {
       wasPaperTraded: false,
     });
 
-    // Auto paper-trade
     const trade = store.addTrade({
       opportunityId: opp.id,
       timestamp: new Date(),
@@ -201,11 +330,11 @@ function checkSymbol(symbol: string): void {
       grossProfitUsd: result.grossPct * notionalSize,
       netProfitUsd: result.netPct * notionalSize,
       netProfitPct: result.netPct,
+      mode: "paper",
     });
 
     opp.wasPaperTraded = true;
 
-    // Broadcast real-time events
     sseManager.broadcast("opportunity", {
       ...opp,
       timestamp: opp.timestamp.toISOString(),
@@ -235,16 +364,37 @@ async function loadExchangeInfo(): Promise<boolean> {
         status: string;
         baseAsset: string;
         quoteAsset: string;
+        baseAssetPrecision: number;
+        quotePrecision: number;
+        filters: { filterType: string; stepSize?: string; minQty?: string }[];
       }[];
     };
 
-    const activePairs: TradingPair[] = data.symbols
-      .filter((s) => s.status === "TRADING")
-      .map((s) => ({
+    const activePairs: TradingPair[] = [];
+
+    for (const s of data.symbols) {
+      if (s.status !== "TRADING") continue;
+
+      activePairs.push({
         symbol: s.symbol,
         baseAsset: s.baseAsset,
         quoteAsset: s.quoteAsset,
-      }));
+      });
+
+      // Extract quantity precision from MARKET_LOT_SIZE (preferred for MARKET
+      // orders) falling back to LOT_SIZE.  A stepSize of "0.00000000" means the
+      // exchange imposes no step constraint — in that case we use basePrecision.
+      const marketLot = s.filters.find((f) => f.filterType === "MARKET_LOT_SIZE");
+      const lot = s.filters.find((f) => f.filterType === "LOT_SIZE");
+      const rawStep = marketLot?.stepSize ?? lot?.stepSize ?? "0";
+      const lotStepSize = parseFloat(rawStep);
+
+      symbolFilters.set(s.symbol, {
+        quotePrecision: s.quotePrecision,
+        basePrecision: s.baseAssetPrecision,
+        lotStepSize: isNaN(lotStepSize) ? 0 : lotStepSize,
+      });
+    }
 
     store.pairsTracked = activePairs.length;
     symbolToTriangles = buildIndex(activePairs);
@@ -258,11 +408,11 @@ async function loadExchangeInfo(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket — multiple connections, one per chunk of ≤500 symbols
+// WebSocket — multiple connections, one per chunk of ≤200 symbols
 // ---------------------------------------------------------------------------
 
 let activeSymbols: string[] = [];
-let connectedCount = 0; // how many of the current connections are open
+let connectedCount = 0;
 
 function handleMessage(raw: Buffer): void {
   try {
@@ -271,7 +421,7 @@ function handleMessage(raw: Buffer): void {
       b?: string;
       a?: string;
     };
-    if (!msg.s) return; // subscription confirmation or other control frame
+    if (!msg.s) return;
     const bid = parseFloat(msg.b!);
     const ask = parseFloat(msg.a!);
     if (!isNaN(bid) && !isNaN(ask)) {
@@ -306,7 +456,6 @@ function openConnection(symbols: string[], connIndex: number): WebSocket {
       store.scannerConnected = false;
       sseManager.broadcast("scanner_status", { connected: false });
     }
-    // Replace this shard after delay
     reconnectTimer = setTimeout(() => {
       wsConns[connIndex] = openConnection(symbols, connIndex);
     }, 5_000);
@@ -325,14 +474,12 @@ function connectWS(): void {
     reconnectTimer = null;
   }
 
-  // Close any existing connections
   for (const ws of wsConns) {
     try { ws.terminate(); } catch { /* ignore */ }
   }
   wsConns = [];
   connectedCount = 0;
 
-  // Chunk symbols and open one connection per chunk
   for (let i = 0; i < activeSymbols.length; i += MAX_SYMBOLS_PER_CONNECTION) {
     const chunk = activeSymbols.slice(i, i + MAX_SYMBOLS_PER_CONNECTION);
     wsConns.push(openConnection(chunk, wsConns.length));
@@ -360,7 +507,6 @@ export async function startScanner(): Promise<void> {
     }, 30_000);
   }
 
-  // Collect all unique symbols that participate in at least one triangle
   activeSymbols = [...symbolToTriangles.keys()];
   logger.info({ count: activeSymbols.length }, "Subscribing to triangle symbols");
 
@@ -371,6 +517,12 @@ export async function startScanner(): Promise<void> {
     const candidates = [...windowCandidates.values()];
     windowCandidates.clear();
     store.setTopScan(candidates);
+
+    // Check daily loss limit on each tick
+    if (store.checkDailyLossLimit()) {
+      logger.warn("Daily loss limit reached on stats tick — reverted to paper mode");
+    }
+
     sseManager.broadcast("stats", store.getStats());
   }, 2_000);
 
