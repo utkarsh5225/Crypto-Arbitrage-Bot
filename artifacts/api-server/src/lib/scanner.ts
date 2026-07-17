@@ -28,14 +28,17 @@ interface Triangle {
 }
 
 const BASE_CURRENCIES = ["USDT", "BTC", "ETH", "BNB"] as const;
-const BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/!bookTicker";
+// The all-symbols !bookTicker stream is silently blocked on shared IPs.
+// Instead, open multiple WS connections each subscribing to ≤500 symbols.
+const BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws";
 const BINANCE_EXCHANGE_URL = "https://api.binance.com/api/v3/exchangeInfo";
+const MAX_SYMBOLS_PER_CONNECTION = 500; // safely under Binance's 1024-stream limit
 
 const priceMap = new Map<string, PriceEntry>();
 let symbolToTriangles = new Map<string, Triangle[]>();
 let exchangeInfoLoaded = false;
 
-let wsConn: WebSocket | null = null;
+let wsConns: WebSocket[] = [];
 let reconnectTimer: NodeJS.Timeout | null = null;
 
 // ---------------------------------------------------------------------------
@@ -233,8 +236,66 @@ async function loadExchangeInfo(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket
+// WebSocket — multiple connections, one per chunk of ≤500 symbols
 // ---------------------------------------------------------------------------
+
+let activeSymbols: string[] = [];
+let connectedCount = 0; // how many of the current connections are open
+
+function handleMessage(raw: Buffer): void {
+  try {
+    const msg = JSON.parse(raw.toString()) as {
+      s?: string;
+      b?: string;
+      a?: string;
+    };
+    if (!msg.s) return; // subscription confirmation or other control frame
+    const bid = parseFloat(msg.b!);
+    const ask = parseFloat(msg.a!);
+    if (!isNaN(bid) && !isNaN(ask)) {
+      priceMap.set(msg.s, { bid, ask });
+      if (exchangeInfoLoaded) checkSymbol(msg.s);
+    }
+  } catch {
+    // ignore malformed messages
+  }
+}
+
+function openConnection(symbols: string[], connIndex: number): WebSocket {
+  const ws = new WebSocket(BINANCE_WS_BASE);
+
+  ws.on("open", () => {
+    const streams = symbols.map((s) => `${s.toLowerCase()}@bookTicker`);
+    ws.send(JSON.stringify({ method: "SUBSCRIBE", params: streams, id: connIndex + 1 }));
+    connectedCount++;
+    logger.info({ connIndex, symbols: symbols.length, total: connectedCount }, "WS shard connected");
+    if (connectedCount === wsConns.length) {
+      store.scannerConnected = true;
+      sseManager.broadcast("scanner_status", { connected: true });
+    }
+  });
+
+  ws.on("message", handleMessage);
+
+  ws.on("close", () => {
+    connectedCount = Math.max(0, connectedCount - 1);
+    logger.warn({ connIndex, connectedCount }, "WS shard closed, reconnecting in 5s...");
+    if (connectedCount === 0) {
+      store.scannerConnected = false;
+      sseManager.broadcast("scanner_status", { connected: false });
+    }
+    // Replace this shard after delay
+    reconnectTimer = setTimeout(() => {
+      wsConns[connIndex] = openConnection(symbols, connIndex);
+    }, 5_000);
+  });
+
+  ws.on("error", (err) => {
+    logger.error({ err, connIndex }, "WS shard error");
+  });
+
+  return ws;
+}
 
 function connectWS(): void {
   if (reconnectTimer) {
@@ -242,46 +303,20 @@ function connectWS(): void {
     reconnectTimer = null;
   }
 
-  logger.info("Connecting to Binance WebSocket...");
-  const ws = new WebSocket(BINANCE_WS_URL);
-  wsConn = ws;
+  // Close any existing connections
+  for (const ws of wsConns) {
+    try { ws.terminate(); } catch { /* ignore */ }
+  }
+  wsConns = [];
+  connectedCount = 0;
 
-  ws.on("open", () => {
-    logger.info("Binance WebSocket connected");
-    store.scannerConnected = true;
-    sseManager.broadcast("scanner_status", { connected: true });
-  });
+  // Chunk symbols and open one connection per chunk
+  for (let i = 0; i < activeSymbols.length; i += MAX_SYMBOLS_PER_CONNECTION) {
+    const chunk = activeSymbols.slice(i, i + MAX_SYMBOLS_PER_CONNECTION);
+    wsConns.push(openConnection(chunk, wsConns.length));
+  }
 
-  ws.on("message", (raw: Buffer) => {
-    try {
-      const msg = JSON.parse(raw.toString()) as {
-        s: string; // symbol
-        b: string; // best bid price
-        a: string; // best ask price
-      };
-      const bid = parseFloat(msg.b);
-      const ask = parseFloat(msg.a);
-      if (!isNaN(bid) && !isNaN(ask)) {
-        priceMap.set(msg.s, { bid, ask });
-        if (exchangeInfoLoaded) checkSymbol(msg.s);
-      }
-    } catch {
-      // ignore malformed messages
-    }
-  });
-
-  ws.on("close", () => {
-    logger.warn("Binance WebSocket closed, reconnecting in 5s...");
-    store.scannerConnected = false;
-    wsConn = null;
-    sseManager.broadcast("scanner_status", { connected: false });
-    reconnectTimer = setTimeout(connectWS, 5_000);
-  });
-
-  ws.on("error", (err) => {
-    logger.error({ err }, "Binance WebSocket error");
-    // "close" event will follow, which triggers reconnect
-  });
+  logger.info({ connections: wsConns.length, totalSymbols: activeSymbols.length }, "Connecting to Binance WebSocket shards...");
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +337,10 @@ export async function startScanner(): Promise<void> {
       await loadExchangeInfo();
     }, 30_000);
   }
+
+  // Collect all unique symbols that participate in at least one triangle
+  activeSymbols = [...symbolToTriangles.keys()];
+  logger.info({ count: activeSymbols.length }, "Subscribing to triangle symbols");
 
   connectWS();
 
