@@ -1,4 +1,6 @@
 import { randomUUID } from "crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 
 export interface BotConfig {
   feeRate: number;
@@ -62,6 +64,49 @@ const MAX_TRADES = 500;
 const MAX_LIVE_ORDERS = 200;
 const TOP_N = 5;
 
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+const DATA_DIR = join(process.cwd(), "data");
+const DATA_FILE = join(DATA_DIR, "store.json");
+
+/** What we write to / read from disk — only the durable subset. */
+interface PersistedState {
+  trades: PaperTrade[];
+  opportunities: ArbitrageOpportunity[];
+  liveOrders: LiveOrder[];
+  totalOpportunities: number;
+  totalTrades: number;
+  totalProfitUsd: number;
+  topToday: TopOpportunity[];
+  dailyLossUsd: number;
+  tradingMode: "paper" | "live";
+  currentDay: string;
+}
+
+function loadPersistedState(): PersistedState | null {
+  try {
+    if (!existsSync(DATA_FILE)) return null;
+    const raw = readFileSync(DATA_FILE, "utf-8");
+    const parsed = JSON.parse(raw) as PersistedState;
+    // Rehydrate Date objects in trades and opportunities
+    parsed.trades = (parsed.trades ?? []).map((t) => ({
+      ...t,
+      timestamp: new Date(t.timestamp),
+    }));
+    parsed.opportunities = (parsed.opportunities ?? []).map((o) => ({
+      ...o,
+      timestamp: new Date(o.timestamp),
+    }));
+    return parsed;
+  } catch (err) {
+    // Corrupted or missing — start fresh
+    console.warn("[store] Failed to load persisted state, starting fresh:", err);
+    return null;
+  }
+}
+
 class Store {
   config: BotConfig = {
     feeRate: 0.001,
@@ -100,12 +145,98 @@ class Store {
   private pathsPerSecondValue = 0;
   private oppTimestamps: number[] = [];
 
+  // Debounce handle for disk writes
+  private saveTimer: NodeJS.Timeout | null = null;
+
+  constructor() {
+    this._restoreFromDisk();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persistence helpers
+  // ---------------------------------------------------------------------------
+
+  private _restoreFromDisk(): void {
+    try {
+      mkdirSync(DATA_DIR, { recursive: true });
+    } catch {
+      // ignore
+    }
+
+    const saved = loadPersistedState();
+    if (!saved) return;
+
+    // Restore durable fields
+    this.trades = saved.trades ?? [];
+    this.opportunities = saved.opportunities ?? [];
+    this.liveOrders = saved.liveOrders ?? [];
+    this.totalOpportunities = saved.totalOpportunities ?? 0;
+    this.totalTrades = saved.totalTrades ?? 0;
+    this.totalProfitUsd = saved.totalProfitUsd ?? 0;
+    this.topToday = saved.topToday ?? [];
+    this.currentDay = saved.currentDay ?? new Date().toDateString();
+
+    // Restore daily loss tracking — reset at day boundary
+    const today = new Date().toDateString();
+    if (saved.currentDay === today) {
+      this.config.dailyLossUsd = saved.dailyLossUsd ?? 0;
+    } else {
+      // New day — reset daily loss
+      this.config.dailyLossUsd = 0;
+      this.currentDay = today;
+    }
+
+    // Restore trading mode
+    if (saved.tradingMode) {
+      this.config.tradingMode = saved.tradingMode;
+    }
+
+    console.info(
+      `[store] Restored ${this.trades.length} trades, ${this.opportunities.length} opportunities from disk.`,
+    );
+  }
+
+  /** Schedule a debounced write — coalesces rapid mutations into one write. */
+  private _scheduleSave(): void {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this._flushToDisk();
+    }, 500);
+  }
+
+  private _flushToDisk(): void {
+    try {
+      mkdirSync(DATA_DIR, { recursive: true });
+      const state: PersistedState = {
+        trades: this.trades,
+        opportunities: this.opportunities,
+        liveOrders: this.liveOrders,
+        totalOpportunities: this.totalOpportunities,
+        totalTrades: this.totalTrades,
+        totalProfitUsd: this.totalProfitUsd,
+        topToday: this.topToday,
+        dailyLossUsd: this.config.dailyLossUsd,
+        tradingMode: this.config.tradingMode,
+        currentDay: this.currentDay,
+      };
+      writeFileSync(DATA_FILE, JSON.stringify(state), "utf-8");
+    } catch (err) {
+      console.error("[store] Failed to persist state to disk:", err);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mutations
+  // ---------------------------------------------------------------------------
+
   addOpportunity(opp: Omit<ArbitrageOpportunity, "id">): ArbitrageOpportunity {
     const full: ArbitrageOpportunity = { ...opp, id: randomUUID() };
     this.opportunities.unshift(full);
     if (this.opportunities.length > MAX_OPPORTUNITIES) this.opportunities.pop();
     this.totalOpportunities++;
     this.oppTimestamps.push(Date.now());
+    this._scheduleSave();
     return full;
   }
 
@@ -121,6 +252,7 @@ class Store {
       this.config.dailyLossUsd += Math.abs(trade.netProfitUsd);
     }
 
+    this._scheduleSave();
     return full;
   }
 
@@ -129,6 +261,7 @@ class Store {
     if (this.liveOrders.length > MAX_LIVE_ORDERS) {
       this.liveOrders.length = MAX_LIVE_ORDERS;
     }
+    this._scheduleSave();
   }
 
   getLiveOrders(limit = 20): LiveOrder[] {
@@ -154,6 +287,7 @@ class Store {
     if (today !== this.currentDay) {
       this.currentDay = today;
       this.config.dailyLossUsd = 0;
+      this._scheduleSave();
     }
 
     if (
@@ -162,6 +296,7 @@ class Store {
       this.config.dailyLossUsd >= this.config.dailyLossLimitUsd
     ) {
       this.config.tradingMode = "paper";
+      this._scheduleSave();
       return true; // Limit hit — caller should broadcast alert
     }
     return false;
@@ -175,6 +310,7 @@ class Store {
       .slice(0, TOP_N);
 
     // Merge into topToday: insert each candidate, resort, trim
+    let topTodayChanged = false;
     for (const c of this.topScan) {
       const key = c.path.join("/");
       const existing = this.topToday.findIndex(
@@ -183,6 +319,7 @@ class Store {
       if (existing !== -1) {
         if (c.netProfitPct > this.topToday[existing].netProfitPct) {
           this.topToday[existing] = c;
+          topTodayChanged = true;
         }
       } else {
         if (
@@ -190,11 +327,14 @@ class Store {
           c.netProfitPct > this.topToday[this.topToday.length - 1].netProfitPct
         ) {
           this.topToday.push(c);
+          topTodayChanged = true;
         }
       }
       this.topToday.sort((a, b) => b.netProfitPct - a.netProfitPct);
       if (this.topToday.length > TOP_N) this.topToday.length = TOP_N;
     }
+
+    if (topTodayChanged) this._scheduleSave();
   }
 
   getStats() {
