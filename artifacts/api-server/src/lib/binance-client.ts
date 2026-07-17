@@ -154,15 +154,20 @@ export class BinanceClient {
    * Returns true when the key/secret can successfully authenticate.
    * A rejected 401/403 response returns false; network errors propagate.
    */
-  async testCredentials(): Promise<boolean> {
+  /**
+   * Returns { valid: true } if the key/secret authenticate successfully.
+   * `canTrade` reflects whether Spot Trading is enabled on the key —
+   * valid credentials with canTrade=false can still be saved so the user
+   * can verify balances; live order placement will warn at trade time.
+   */
+  async testCredentials(): Promise<{ valid: boolean; canTrade: boolean }> {
     try {
       const account = await this.getAccount();
-      return account.canTrade;
+      return { valid: true, canTrade: account.canTrade };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Only treat auth failures as "invalid credentials" — don't swallow network errors
       if (msg.includes("401") || msg.includes("403") || msg.includes("-2014") || msg.includes("-2015")) {
-        return false;
+        return { valid: false, canTrade: false };
       }
       throw err;
     }

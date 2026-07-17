@@ -86,18 +86,28 @@ router.post("/config/credentials", async (req, res) => {
 
   // Validate credentials by calling GET /api/v3/account
   const client = createClient(apiKey, apiSecret);
-  const valid = await client.testCredentials().catch(() => false);
-  if (!valid) {
+  let result: { valid: boolean; canTrade: boolean };
+  try {
+    result = await client.testCredentials();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(502).json({ error: `Could not reach Binance to validate credentials: ${msg}` });
+    return;
+  }
+
+  if (!result.valid) {
     res.status(401).json({ error: "Binance rejected the credentials — check your API key and secret" });
     return;
   }
 
   setCredentials(apiKey, apiSecret);
-  logger.info("Binance credentials saved and validated");
+  logger.info({ canTrade: result.canTrade }, "Binance credentials saved and validated");
 
   res.json({
     configured: true,
+    canTrade: result.canTrade,
     maskedKey: getMaskedKey(),
+    warning: result.canTrade ? undefined : "Credentials saved, but Spot Trading is not enabled on this API key. Enable it in Binance → API Management to place live orders.",
   });
 });
 
