@@ -11,6 +11,24 @@ the public internet.
 
 ---
 
+## Quickstart (automated)
+
+If you'd rather not run the steps by hand, the whole server-side setup is one
+idempotent script. SSH into a fresh Ubuntu VPS as root and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/utkarsh5225/Crypto-Arbitrage-Bot/claude/binance-live-trading-api-59vybf/deploy/setup.sh | bash
+```
+
+It installs Node/pnpm, creates the `arbbot` user, clones + builds, generates the
+encryption key, and starts the systemd service. When it finishes it prints your
+VPS IP and the exact SSH-tunnel command. You then only need to: whitelist the IP
+in Binance, enter your API keys, and open the tunnel (§8–§10 below).
+
+The manual steps below explain each part and are the reference if anything fails.
+
+---
+
 ## 0. Architecture at a glance
 
 - **One process**: the Express server (`@workspace/api-server`) serves the built
