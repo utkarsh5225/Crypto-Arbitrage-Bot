@@ -1,0 +1,34 @@
+[Unit]
+Description=Crypto Triangular Arbitrage Bot (API + dashboard, single process)
+Documentation=file:///opt/crypto-arb-bot/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arbbot
+Group=arbbot
+
+# Absolute path to the cloned repo's server package.
+WorkingDirectory=/opt/crypto-arb-bot/artifacts/api-server
+
+# Secrets and config live here (chmod 600, owned by arbbot).
+EnvironmentFile=/etc/crypto-arb-bot.env
+
+# Runs the esbuild bundle produced by `pnpm --filter @workspace/api-server run build`.
+# Adjust the node path if you did not install Node from NodeSource (`which node`).
+ExecStart=/usr/bin/node dist/index.mjs
+
+Restart=always
+RestartSec=5
+
+# --- Hardening -------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# The bot persists trade history + encrypted credentials under its working dir.
+ReadWritePaths=/opt/crypto-arb-bot/artifacts/api-server
+
+[Install]
+WantedBy=multi-user.target
