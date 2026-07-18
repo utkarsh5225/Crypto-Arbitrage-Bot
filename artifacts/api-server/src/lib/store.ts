@@ -10,6 +10,7 @@ export interface BotConfig {
   maxNotionalPerTrade: number;
   dailyLossLimitUsd: number;
   dailyLossUsd: number; // read-only; managed internally
+  useTestnet: boolean; // route live orders/account to Binance Spot Testnet
 }
 
 export interface ArbitrageOpportunity {
@@ -82,6 +83,7 @@ interface PersistedState {
   topToday: TopOpportunity[];
   dailyLossUsd: number;
   tradingMode: "paper" | "live";
+  useTestnet: boolean;
   currentDay: string;
 }
 
@@ -116,6 +118,7 @@ class Store {
     maxNotionalPerTrade: 1000,
     dailyLossLimitUsd: 50,
     dailyLossUsd: 0,
+    useTestnet: false,
   };
 
   opportunities: ArbitrageOpportunity[] = [];
@@ -191,6 +194,11 @@ class Store {
       this.config.tradingMode = saved.tradingMode;
     }
 
+    // Restore testnet flag
+    if (typeof saved.useTestnet === "boolean") {
+      this.config.useTestnet = saved.useTestnet;
+    }
+
     console.info(
       `[store] Restored ${this.trades.length} trades, ${this.opportunities.length} opportunities from disk.`,
     );
@@ -218,6 +226,7 @@ class Store {
         topToday: this.topToday,
         dailyLossUsd: this.config.dailyLossUsd,
         tradingMode: this.config.tradingMode,
+        useTestnet: this.config.useTestnet,
         currentDay: this.currentDay,
       };
       writeFileSync(DATA_FILE, JSON.stringify(state), "utf-8");

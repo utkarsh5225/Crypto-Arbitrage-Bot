@@ -270,6 +270,9 @@ components:
         dailyLossUsd:
           type: number
           description: Current day realised loss in USD (read-only, set by server)
+        useTestnet:
+          type: boolean
+          description: Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production
       required:
         - feeRate
         - minProfitThreshold
@@ -278,6 +281,7 @@ components:
         - maxNotionalPerTrade
         - dailyLossLimitUsd
         - dailyLossUsd
+        - useTestnet
 
     BotConfigInput:
       type: object
@@ -295,6 +299,8 @@ components:
           type: number
         dailyLossLimitUsd:
           type: number
+        useTestnet:
+          type: boolean
 
     CredentialsInput:
       type: object

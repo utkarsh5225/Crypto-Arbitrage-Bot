@@ -24,7 +24,7 @@ router.get("/account/balances", async (_req, res) => {
   if (!requireLiveMode(res)) return;
 
   const creds = getCredentials()!;
-  const client = createClient(creds.apiKey, creds.apiSecret);
+  const client = createClient(creds.apiKey, creds.apiSecret, store.config.useTestnet);
 
   try {
     const account = await client.getAccount();

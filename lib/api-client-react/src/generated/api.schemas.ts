@@ -35,6 +35,8 @@ export interface BotConfig {
   dailyLossLimitUsd: number;
   /** Current day realised loss in USD (read-only, set by server) */
   dailyLossUsd: number;
+  /** Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production */
+  useTestnet: boolean;
 }
 
 export type BotConfigInputTradingMode = typeof BotConfigInputTradingMode[keyof typeof BotConfigInputTradingMode];
@@ -52,6 +54,7 @@ export interface BotConfigInput {
   tradingMode?: BotConfigInputTradingMode;
   maxNotionalPerTrade?: number;
   dailyLossLimitUsd?: number;
+  useTestnet?: boolean;
 }
 
 export interface CredentialsInput {

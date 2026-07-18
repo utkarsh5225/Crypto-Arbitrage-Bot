@@ -49,6 +49,7 @@ export default function Dashboard() {
 
   const isLive = stats?.tradingMode === 'live';
   const credentialsConfigured = credStatus?.configured ?? false;
+  const useTestnet = config?.useTestnet ?? false;
 
   // Account data (live mode only)
   const { data: balancesData, refetch: refetchBalances } = useGetAccountBalances({
@@ -158,6 +159,24 @@ export default function Dashboard() {
         refetchOrders();
       },
       onError: (err) => toast.error('Cannot enable live mode: ' + err.message),
+    });
+  };
+
+  const handleToggleTestnet = () => {
+    if (isLive) {
+      toast.error('Switch to Paper mode before changing the network');
+      return;
+    }
+    const next = !useTestnet;
+    updateConfig.mutate({ data: { useTestnet: next } }, {
+      onSuccess: () => {
+        toast.success(next
+          ? 'Testnet enabled — save your testnet.binance.vision API keys'
+          : 'Switched to Production network');
+        refetchConfig();
+        refetchCreds();
+      },
+      onError: (err) => toast.error(err.message),
     });
   };
 
@@ -439,6 +458,44 @@ export default function Dashboard() {
 
               {/* Credentials */}
               <div className="border-t border-border pt-4">
+                {/* Network selector: Production vs Testnet */}
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    Network
+                  </p>
+                  <div className="flex items-center gap-1 border border-border rounded-md overflow-hidden">
+                    <button
+                      onClick={() => useTestnet && handleToggleTestnet()}
+                      disabled={isLive}
+                      title={isLive ? 'Switch to Paper mode to change network' : undefined}
+                      className={cn(
+                        'px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider transition-colors',
+                        !useTestnet ? 'bg-primary text-background' : 'bg-transparent text-muted-foreground hover:text-foreground',
+                        isLive && 'cursor-not-allowed opacity-60',
+                      )}
+                    >
+                      Production
+                    </button>
+                    <button
+                      onClick={() => !useTestnet && handleToggleTestnet()}
+                      disabled={isLive}
+                      title={isLive ? 'Switch to Paper mode to change network' : undefined}
+                      className={cn(
+                        'px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider transition-colors',
+                        useTestnet ? 'bg-sky-500 text-black' : 'bg-transparent text-muted-foreground hover:text-sky-400',
+                        isLive && 'cursor-not-allowed opacity-60',
+                      )}
+                    >
+                      🧪 Testnet
+                    </button>
+                  </div>
+                </div>
+                {useTestnet && (
+                  <div className="mb-2 text-[10px] text-sky-400/90 bg-sky-500/10 rounded px-2 py-1.5">
+                    Testnet uses separate API keys from{' '}
+                    <code className="select-all">testnet.binance.vision</code> and fake funds — safe for validating live execution.
+                  </div>
+                )}
                 <div className="flex items-center justify-between mb-2">
                   <p className="text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
                     <Key className="h-3 w-3" /> Binance API Credentials
@@ -531,6 +588,7 @@ export default function Dashboard() {
         <LiveModeConfirmModal
           dailyLossLimit={config?.dailyLossLimitUsd ?? 50}
           maxNotional={config?.maxNotionalPerTrade ?? 1000}
+          useTestnet={useTestnet}
           onConfirm={handleConfirmLive}
           onCancel={() => setShowLiveConfirm(false)}
         />
@@ -765,10 +823,11 @@ function OrderHistoryPanel({ orders }: { orders: LiveOrder[] }) {
 }
 
 function LiveModeConfirmModal({
-  dailyLossLimit, maxNotional, onConfirm, onCancel,
+  dailyLossLimit, maxNotional, useTestnet, onConfirm, onCancel,
 }: {
   dailyLossLimit: number;
   maxNotional: number;
+  useTestnet: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -781,16 +840,25 @@ function LiveModeConfirmModal({
           </div>
           <div>
             <h2 className="font-bold text-lg tracking-tight">Enable Live Trading</h2>
-            <p className="text-xs text-muted-foreground">Real money will be used</p>
+            <p className="text-xs text-muted-foreground">
+              {useTestnet ? 'Testnet — no real money at risk' : 'Real money will be used'}
+            </p>
           </div>
         </div>
+
+        {useTestnet && (
+          <div className="bg-sky-500/10 border border-sky-500/30 rounded-lg p-3 mb-4 text-xs text-sky-300">
+            🧪 <span className="font-bold">Testnet mode</span> — orders route to testnet.binance.vision with fake funds. Great for validating the full execution path safely.
+          </div>
+        )}
 
         <div className="bg-amber-500/5 border border-amber-500/20 rounded-lg p-4 mb-5 space-y-2 text-sm">
           <p className="text-amber-300 font-bold text-xs uppercase tracking-wider mb-2">You acknowledge that:</p>
           <ul className="space-y-1.5 text-muted-foreground text-xs">
-            <li>⚡ Real market orders will fire on your Binance account</li>
+            <li>⚡ {useTestnet ? 'Simulated' : 'Real'} market orders will fire on {useTestnet ? 'Binance Testnet' : 'your Binance account'}</li>
             <li>📦 Each triangle executes 3 sequential market orders</li>
-            <li>❌ Partial failures are NOT auto-unwound</li>
+            <li>🔁 A failed leg triggers a best-effort unwind back to USDT</li>
+            <li>🚫 Triangles below Binance minimum notional are skipped</li>
             <li>🛡 Bot pauses at daily loss limit: <span className="text-foreground font-bold">{formatUsd(dailyLossLimit)}</span></li>
             <li>💰 Max notional per trade: <span className="text-foreground font-bold">{formatUsd(maxNotional)}</span></li>
             <li>🔴 Use the Kill Switch to stop immediately</li>

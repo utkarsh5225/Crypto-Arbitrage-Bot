@@ -22,6 +22,7 @@ router.put("/config", (req, res) => {
     tradingMode?: unknown;
     maxNotionalPerTrade?: unknown;
     dailyLossLimitUsd?: unknown;
+    useTestnet?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -42,6 +43,20 @@ router.put("/config", (req, res) => {
   }
   if (typeof body.dailyLossLimitUsd === "number" && body.dailyLossLimitUsd >= 0) {
     store.config.dailyLossLimitUsd = body.dailyLossLimitUsd;
+  }
+
+  // Testnet toggle — only allowed while paper trading, since production and
+  // testnet use different API keys and different funds. Flipping networks
+  // mid-live-trading would silently invalidate the active credentials.
+  if (typeof body.useTestnet === "boolean") {
+    if (body.useTestnet !== store.config.useTestnet && store.config.tradingMode === "live") {
+      res.status(400).json({
+        error: "Cannot switch Testnet on/off while Live mode is active — switch to Paper mode first",
+      });
+      return;
+    }
+    store.config.useTestnet = body.useTestnet;
+    logger.info({ useTestnet: body.useTestnet }, "Testnet mode changed");
   }
 
   // Trading mode switch — requires credentials to enable live
@@ -84,8 +99,9 @@ router.post("/config/credentials", async (req, res) => {
   const apiKey = body.apiKey.trim();
   const apiSecret = body.apiSecret.trim();
 
-  // Validate credentials by calling GET /api/v3/account
-  const client = createClient(apiKey, apiSecret);
+  // Validate credentials by calling GET /api/v3/account on the active network
+  // (testnet keys only authenticate against testnet, and vice-versa).
+  const client = createClient(apiKey, apiSecret, store.config.useTestnet);
   let result: { valid: boolean; canTrade: boolean };
   try {
     result = await client.testCredentials();

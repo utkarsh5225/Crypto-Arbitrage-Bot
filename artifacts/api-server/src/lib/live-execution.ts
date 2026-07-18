@@ -13,10 +13,29 @@
  *  - Daily loss limit is checked before execution; see scanner.ts
  */
 
-import { createClient, type BinanceOrderResult } from "./binance-client";
+import { createClient, type BinanceClient, type BinanceOrderResult } from "./binance-client";
 import { getSymbolFilters } from "./scanner";
 import { type LiveOrder } from "./store";
 import { logger } from "./logger";
+
+/**
+ * Thrown when a triangle aborts mid-execution. Carries the legs that DID fill,
+ * plus the outcome of the best-effort unwind that converts any stranded
+ * intermediate asset back to USDT, so the caller can record everything in the
+ * order history.
+ */
+export class LiveTradeError extends Error {
+  constructor(
+    message: string,
+    public readonly failedLeg: number,
+    public readonly filledOrders: LiveOrder[],
+    public readonly unwindOrder: LiveOrder | null,
+    public readonly unwindError?: string,
+  ) {
+    super(message);
+    this.name = "LiveTradeError";
+  }
+}
 
 export interface TriangleForExecution {
   path: string[]; // e.g. ["USDT","BTC","ETH","USDT"]
@@ -96,12 +115,74 @@ function avgFillPrice(order: BinanceOrderResult): number {
  *
  * Returns the trade result on success; throws on any leg failure.
  */
+/**
+ * Best-effort unwind: convert a stranded intermediate asset back to USDT after
+ * a triangle aborts. Places a MARKET SELL on `${asset}USDT` for the amount we
+ * are holding. Returns the resulting LiveOrder, or null (with a reason logged)
+ * if the conversion could not be attempted or failed.
+ *
+ * This is intentionally forgiving — an unwind failure must never mask the
+ * original leg failure, so it only ever returns null instead of throwing.
+ */
+async function attemptUnwind(
+  client: BinanceClient,
+  asset: string,
+  amount: number,
+  pathLabel: string,
+  failedLeg: number,
+): Promise<{ order: LiveOrder | null; error?: string }> {
+  if (asset === "USDT") {
+    // Nothing was converted yet (leg 1 failed) — no position to unwind.
+    return { order: null };
+  }
+
+  const symbol = `${asset}USDT`;
+  const filters = getSymbolFilters(symbol);
+  const qty = roundToStep(amount, filters.lotStepSize, filters.basePrecision);
+
+  if (qty <= 0) {
+    const error = `Unwind skipped: ${amount} ${asset} rounds to zero on ${symbol}`;
+    logger.warn({ asset, amount, symbol }, error);
+    return { order: null, error };
+  }
+
+  logger.warn(
+    { asset, symbol, qty, path: pathLabel, failedLeg },
+    "Attempting to unwind stranded asset back to USDT",
+  );
+
+  try {
+    const order = await client.placeMarketOrder(symbol, "SELL", { quantity: qty });
+    const liveOrder: LiveOrder = {
+      orderId: order.orderId,
+      symbol,
+      side: "SELL",
+      executedQty: parseFloat(order.executedQty),
+      avgPrice: avgFillPrice(order),
+      status: `UNWIND_${order.status}`,
+      timestamp: new Date(order.transactTime).toISOString(),
+      leg: failedLeg,
+      trianglePath: `${pathLabel} (unwind)`,
+    };
+    logger.info(
+      { symbol, orderId: order.orderId, recoveredUsdt: order.cummulativeQuoteQty },
+      "Unwind complete — stranded asset converted back to USDT",
+    );
+    return { order: liveOrder };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logger.error({ err, symbol, asset, qty }, "Unwind failed — position left open");
+    return { order: null, error };
+  }
+}
+
 export async function executeLiveTrade(
   tri: TriangleForExecution,
   opportunityId: string,
   notionalSize: number,
   apiKey: string,
   apiSecret: string,
+  useTestnet = false,
 ): Promise<LiveTradeResult> {
   if (tri.path[0] !== "USDT") {
     throw new Error(
@@ -109,7 +190,7 @@ export async function executeLiveTrade(
     );
   }
 
-  const client = createClient(apiKey, apiSecret);
+  const client = createClient(apiKey, apiSecret, useTestnet);
   const orderIds: number[] = [];
   const fillPrices: number[] = [];
   const liveOrders: LiveOrder[] = [];
@@ -122,6 +203,26 @@ export async function executeLiveTrade(
     const buy = tri.buys[i];
     const side = buy ? "BUY" : "SELL";
     const filters = getSymbolFilters(symbol);
+    // Asset held going INTO this leg — what would be stranded if the leg fails.
+    const heldAsset = tri.path[i];
+
+    /** Abort the triangle, attempting to unwind whatever we are still holding. */
+    const abort = async (reason: string): Promise<never> => {
+      const { order, error } = await attemptUnwind(
+        client,
+        heldAsset,
+        currentAmount,
+        pathLabel,
+        i + 1,
+      );
+      throw new LiveTradeError(
+        `Leg ${i + 1} (${symbol} ${side}) failed: ${reason}`,
+        i + 1,
+        liveOrders,
+        order,
+        error,
+      );
+    };
 
     let roundedAmount: number;
     let orderQty: { quoteOrderQty: number } | { quantity: number };
@@ -150,9 +251,10 @@ export async function executeLiveTrade(
     );
 
     if (roundedAmount <= 0) {
-      throw new Error(
-        `Leg ${i + 1} (${symbol} ${side}): rounded amount is zero after precision adjustment ` +
-        `(raw=${currentAmount}, stepSize=${filters.lotStepSize}, quotePrecision=${filters.quotePrecision})`,
+      // No order placed yet — the held asset is unchanged, so unwind it.
+      await abort(
+        `rounded amount is zero after precision adjustment ` +
+          `(raw=${currentAmount}, stepSize=${filters.lotStepSize}, quotePrecision=${filters.quotePrecision})`,
       );
     }
 
@@ -160,8 +262,29 @@ export async function executeLiveTrade(
     try {
       order = await client.placeMarketOrder(symbol, side, orderQty);
     } catch (err) {
+      // Order rejected / network error — nothing filled, held asset unchanged.
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`Leg ${i + 1} (${symbol} ${side}) failed: ${msg}`);
+      await abort(msg);
+      return undefined as never; // unreachable; keeps the type checker happy
+    }
+
+    // ── Fill verification ────────────────────────────────────────────────────
+    // A MARKET order can EXPIRE or be REJECTED with zero fill (e.g. no
+    // liquidity). Threading a zero amount into the next leg would corrupt the
+    // whole triangle, so treat any zero-fill as a leg failure and unwind.
+    const executedQty = parseFloat(order.executedQty);
+    if (!(executedQty > 0)) {
+      await abort(
+        `order did not fill (status=${order.status}, executedQty=${order.executedQty})`,
+      );
+    }
+    if (order.status !== "FILLED") {
+      // Partial fill: continue with the ACTUAL executed amounts below, but flag
+      // it — the remaining legs will size off real fills, not the request.
+      logger.warn(
+        { leg: i + 1, symbol, status: order.status, executedQty },
+        "Leg only partially filled — continuing with actual executed amount",
+      );
     }
 
     const fillPrice = avgFillPrice(order);
@@ -172,7 +295,7 @@ export async function executeLiveTrade(
       orderId: order.orderId,
       symbol,
       side,
-      executedQty: parseFloat(order.executedQty),
+      executedQty,
       avgPrice: fillPrice,
       status: order.status,
       timestamp: new Date(order.transactTime).toISOString(),
@@ -180,10 +303,10 @@ export async function executeLiveTrade(
       trianglePath: pathLabel,
     });
 
-    // Thread the running amount to the next leg
+    // Thread the running amount to the next leg (always the ACTUAL fill)
     if (buy) {
       // Received base asset from the BUY
-      currentAmount = parseFloat(order.executedQty);
+      currentAmount = executedQty;
     } else {
       // Received quote asset from the SELL
       currentAmount = parseFloat(order.cummulativeQuoteQty);

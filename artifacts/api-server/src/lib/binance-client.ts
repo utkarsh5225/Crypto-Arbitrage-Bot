@@ -15,7 +15,10 @@
 import crypto from "crypto";
 import { logger } from "./logger";
 
-const BASE_URL = "https://api.binance.com";
+/** Production Spot REST endpoint (real funds). */
+const MAINNET_BASE_URL = "https://api.binance.com";
+/** Spot Testnet REST endpoint (fake funds) — same /api/v3 paths as production. */
+const TESTNET_BASE_URL = "https://testnet.binance.vision";
 const RECV_WINDOW = 5000;
 
 export interface BinanceFill {
@@ -48,10 +51,15 @@ export interface BinanceAccount {
 }
 
 export class BinanceClient {
+  private readonly baseUrl: string;
+
   constructor(
     private readonly apiKey: string,
     private readonly apiSecret: string,
-  ) {}
+    useTestnet = false,
+  ) {
+    this.baseUrl = useTestnet ? TESTNET_BASE_URL : MAINNET_BASE_URL;
+  }
 
   /** HMAC-SHA256 of the canonical query string. */
   private sign(canonicalString: string): string {
@@ -86,7 +94,7 @@ export class BinanceClient {
       .join("&");
 
     const signature = this.sign(canonicalQS);
-    const url = `${BASE_URL}${path}?${canonicalQS}&signature=${signature}`;
+    const url = `${this.baseUrl}${path}?${canonicalQS}&signature=${signature}`;
 
     logger.debug({ method, path, params: Object.keys(allParams) }, "Binance API request");
 
@@ -174,7 +182,16 @@ export class BinanceClient {
   }
 }
 
-/** Factory: builds a BinanceClient from the provided credentials. */
-export function createClient(apiKey: string, apiSecret: string): BinanceClient {
-  return new BinanceClient(apiKey, apiSecret);
+/**
+ * Factory: builds a BinanceClient from the provided credentials.
+ * Pass `useTestnet = true` to route requests to the Spot Testnet endpoint.
+ * Note: testnet issues its OWN API key/secret (from testnet.binance.vision) —
+ * production keys will be rejected there and vice-versa.
+ */
+export function createClient(
+  apiKey: string,
+  apiSecret: string,
+  useTestnet = false,
+): BinanceClient {
+  return new BinanceClient(apiKey, apiSecret, useTestnet);
 }

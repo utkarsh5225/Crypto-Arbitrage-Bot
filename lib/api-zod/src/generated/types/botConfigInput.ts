@@ -14,4 +14,5 @@ export interface BotConfigInput {
   tradingMode?: BotConfigInputTradingMode;
   maxNotionalPerTrade?: number;
   dailyLossLimitUsd?: number;
+  useTestnet?: boolean;
 }

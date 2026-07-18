@@ -3,7 +3,7 @@ import { logger } from "./logger";
 import { store, type TopOpportunity } from "./store";
 import { sseManager } from "./sse-manager";
 import { getCredentials } from "./credentials";
-import { executeLiveTrade } from "./live-execution";
+import { executeLiveTrade, LiveTradeError } from "./live-execution";
 
 interface PriceEntry {
   bid: number;
@@ -30,6 +30,12 @@ export interface SymbolFilters {
    * 0 means no constraint beyond basePrecision.
    */
   lotStepSize: number;
+  /**
+   * Minimum order value in the QUOTE asset, from the NOTIONAL (or MIN_NOTIONAL)
+   * filter. Binance rejects any order whose price×quantity is below this.
+   * 0 means no minimum was published for the symbol.
+   */
+  minNotional: number;
 }
 
 const symbolFilters = new Map<string, SymbolFilters>();
@@ -40,7 +46,14 @@ const symbolFilters = new Map<string, SymbolFilters>();
  * was not found in exchange info.
  */
 export function getSymbolFilters(symbol: string): SymbolFilters {
-  return symbolFilters.get(symbol) ?? { quotePrecision: 8, basePrecision: 8, lotStepSize: 0 };
+  return (
+    symbolFilters.get(symbol) ?? {
+      quotePrecision: 8,
+      basePrecision: 8,
+      lotStepSize: 0,
+      minNotional: 0,
+    }
+  );
 }
 
 interface Triangle {
@@ -197,6 +210,44 @@ function evalTriangle(
   return { grossPct, netPct, prices };
 }
 
+/**
+ * Pre-flight MIN_NOTIONAL guard.
+ *
+ * Simulates the notional value (in each pair's quote asset) that every leg of
+ * the triangle would carry for a given starting USDT notional, using the exact
+ * book prices captured in `evalTriangle`. Returns the first leg whose order
+ * value would fall below Binance's published minimum, or null if all legs pass.
+ *
+ * This runs BEFORE any order is placed so a shrinking triangle can be skipped
+ * instead of being rejected mid-execution (which would strand an intermediate
+ * asset).
+ */
+function findSubMinNotionalLeg(
+  tri: Triangle,
+  prices: number[],
+  notional: number,
+): { leg: number; symbol: string; legNotional: number; minNotional: number } | null {
+  let amount = notional;
+  for (let i = 0; i < 3; i++) {
+    const price = prices[i];
+    const filters = getSymbolFilters(tri.symbols[i]);
+    // For a BUY we spend `amount` of the quote asset; for a SELL we receive
+    // `amount * price` of the quote asset. Either way that value is what
+    // Binance measures against minNotional for the leg.
+    const legNotional = tri.buys[i] ? amount : amount * price;
+    if (filters.minNotional > 0 && legNotional < filters.minNotional) {
+      return {
+        leg: i + 1,
+        symbol: tri.symbols[i],
+        legNotional,
+        minNotional: filters.minNotional,
+      };
+    }
+    amount = tri.buys[i] ? amount / price : amount * price;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Symbol update handler
 // ---------------------------------------------------------------------------
@@ -250,6 +301,21 @@ function checkSymbol(symbol: string): void {
         sseManager.broadcast("stats", store.getStats());
         // tradingMode is now 'paper'; fall through to paper logic below
       } else {
+        const tradeNotional = Math.min(notionalSize, store.config.maxNotionalPerTrade);
+
+        // Pre-flight MIN_NOTIONAL guard — skip triangles that would be rejected
+        // mid-execution (which would strand an intermediate asset). Applies a
+        // small cooldown so we don't re-evaluate the same failing path every tick.
+        const subMin = findSubMinNotionalLeg(tri, result.prices, tradeNotional);
+        if (subMin) {
+          recentlyTraded.set(pathKey, Date.now());
+          logger.warn(
+            { path: pathKey, ...subMin },
+            "Skipping live trade — leg notional below Binance minimum",
+          );
+          continue;
+        }
+
         // Mark cooldown and record opportunity before async execution
         recentlyTraded.set(pathKey, Date.now());
         const opp = store.addOpportunity({
@@ -262,10 +328,15 @@ function checkSymbol(symbol: string): void {
           wasPaperTraded: false,
         });
 
-        const tradeNotional = Math.min(notionalSize, store.config.maxNotionalPerTrade);
-
         // Fire live trade asynchronously — never block the WS message handler
-        executeLiveTrade(tri, opp.id, tradeNotional, creds.apiKey, creds.apiSecret)
+        executeLiveTrade(
+          tri,
+          opp.id,
+          tradeNotional,
+          creds.apiKey,
+          creds.apiSecret,
+          store.config.useTestnet,
+        )
           .then((liveResult) => {
             // Success — reset consecutive failure counter
             consecutiveLiveFailures = 0;
@@ -307,12 +378,24 @@ function checkSymbol(symbol: string): void {
             const errorMsg = err instanceof Error ? err.message : String(err);
             logger.error({ err, path: tri.path.join("→") }, "Live trade failed");
 
-            // Parse which leg failed from the error message ("Leg N (…) failed: …")
+            // LiveTradeError carries structured detail: which leg failed, the
+            // legs that DID fill, and the outcome of the unwind attempt.
+            const isStructured = err instanceof LiveTradeError;
             const legMatch = errorMsg.match(/Leg (\d+)/);
-            const failedLeg = legMatch ? parseInt(legMatch[1], 10) : 0;
+            const failedLeg = isStructured
+              ? err.failedLeg
+              : legMatch
+                ? parseInt(legMatch[1], 10)
+                : 0;
+            const unwindOrder = isStructured ? err.unwindOrder : null;
+            const unwindError = isStructured ? err.unwindError : undefined;
+            const filledOrders = isStructured ? err.filledOrders : [];
 
-            // Record a sentinel entry in Order History so the failure is visible
-            store.addLiveOrders([{
+            // Persist the partial fills, the unwind order (if any), and a
+            // sentinel ERROR marker — newest first, so they read top-to-bottom.
+            const historyEntries: typeof filledOrders = [];
+            if (unwindOrder) historyEntries.push(unwindOrder);
+            historyEntries.push({
               orderId: -Date.now(),
               symbol: tri.symbols[Math.max(0, failedLeg - 1)] ?? tri.symbols[0],
               side: tri.buys[Math.max(0, failedLeg - 1)] ? "BUY" : "SELL",
@@ -322,13 +405,18 @@ function checkSymbol(symbol: string): void {
               timestamp: new Date().toISOString(),
               leg: failedLeg || 1,
               trianglePath: tri.path.join("→"),
-            }]);
+            });
+            // filledOrders are chronological (leg 1..n); reverse so newest-first.
+            for (const o of [...filledOrders].reverse()) historyEntries.push(o);
+            store.addLiveOrders(historyEntries);
 
             // Broadcast the failure event so the dashboard can alert the user
             sseManager.broadcast("live_trade_failed", {
               path: tri.path,
               failedLeg,
               error: errorMsg,
+              unwound: unwindOrder !== null,
+              unwindError,
               timestamp: new Date().toISOString(),
             });
 
@@ -416,7 +504,13 @@ async function loadExchangeInfo(): Promise<boolean> {
         quoteAsset: string;
         baseAssetPrecision: number;
         quotePrecision: number;
-        filters: { filterType: string; stepSize?: string; minQty?: string }[];
+        filters: {
+          filterType: string;
+          stepSize?: string;
+          minQty?: string;
+          minNotional?: string;
+          notional?: string;
+        }[];
       }[];
     };
 
@@ -439,10 +533,19 @@ async function loadExchangeInfo(): Promise<boolean> {
       const rawStep = marketLot?.stepSize ?? lot?.stepSize ?? "0";
       const lotStepSize = parseFloat(rawStep);
 
+      // Minimum order value in the quote asset. Newer exchange info uses the
+      // NOTIONAL filter (field `minNotional`); older uses MIN_NOTIONAL.
+      const notionalFilter =
+        s.filters.find((f) => f.filterType === "NOTIONAL") ??
+        s.filters.find((f) => f.filterType === "MIN_NOTIONAL");
+      const rawMinNotional = notionalFilter?.minNotional ?? notionalFilter?.notional ?? "0";
+      const minNotional = parseFloat(rawMinNotional);
+
       symbolFilters.set(s.symbol, {
         quotePrecision: s.quotePrecision,
         basePrecision: s.baseAssetPrecision,
         lotStepSize: isNaN(lotStepSize) ? 0 : lotStepSize,
+        minNotional: isNaN(minNotional) ? 0 : minNotional,
       });
     }
 

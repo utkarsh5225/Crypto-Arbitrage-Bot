@@ -22,4 +22,6 @@ export interface BotConfig {
   dailyLossLimitUsd: number;
   /** Current day realised loss in USD (read-only, set by server) */
   dailyLossUsd: number;
+  /** Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production */
+  useTestnet: boolean;
 }

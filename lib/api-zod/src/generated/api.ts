@@ -28,7 +28,8 @@ export const GetConfigResponse = zod.object({
   "tradingMode": zod.enum(['paper', 'live']).describe('Whether to paper-trade or execute real orders on Binance'),
   "maxNotionalPerTrade": zod.number().describe('Maximum USDT notional per live trade (safety cap)'),
   "dailyLossLimitUsd": zod.number().describe('Revert to paper mode if realised daily loss exceeds this value'),
-  "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)')
+  "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)'),
+  "useTestnet": zod.boolean().describe('Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production')
 })
 
 
@@ -41,7 +42,8 @@ export const UpdateConfigBody = zod.object({
   "notionalSize": zod.number().optional(),
   "tradingMode": zod.enum(['paper', 'live']).optional(),
   "maxNotionalPerTrade": zod.number().optional(),
-  "dailyLossLimitUsd": zod.number().optional()
+  "dailyLossLimitUsd": zod.number().optional(),
+  "useTestnet": zod.boolean().optional()
 })
 
 export const UpdateConfigResponse = zod.object({
@@ -51,7 +53,8 @@ export const UpdateConfigResponse = zod.object({
   "tradingMode": zod.enum(['paper', 'live']).describe('Whether to paper-trade or execute real orders on Binance'),
   "maxNotionalPerTrade": zod.number().describe('Maximum USDT notional per live trade (safety cap)'),
   "dailyLossLimitUsd": zod.number().describe('Revert to paper mode if realised daily loss exceeds this value'),
-  "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)')
+  "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)'),
+  "useTestnet": zod.boolean().describe('Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production')
 })
 
 
