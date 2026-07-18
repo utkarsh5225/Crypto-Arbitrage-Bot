@@ -273,6 +273,9 @@ components:
         useTestnet:
           type: boolean
           description: Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production
+        maxSlippagePct:
+          type: number
+          description: Abort a live triangle if a leg fills worse than expected by more than this fraction (0 disables)
       required:
         - feeRate
         - minProfitThreshold
@@ -282,6 +285,7 @@ components:
         - dailyLossLimitUsd
         - dailyLossUsd
         - useTestnet
+        - maxSlippagePct
 
     BotConfigInput:
       type: object
@@ -301,6 +305,8 @@ components:
           type: number
         useTestnet:
           type: boolean
+        maxSlippagePct:
+          type: number
 
     CredentialsInput:
       type: object
@@ -591,7 +597,13 @@ components:
           description: Total trades executed
         totalProfitUsd:
           type: number
-          description: Cumulative net P&L in USD
+          description: Cumulative net P&L in USD (paper + live combined)
+        paperProfitUsd:
+          type: number
+          description: Cumulative net P&L from paper trades only
+        liveProfitUsd:
+          type: number
+          description: Cumulative net P&L from live trades only
         winRate:
           type: number
           description: Fraction of trades that were profitable
@@ -634,6 +646,8 @@ components:
         - totalOpportunities
         - totalTrades
         - totalProfitUsd
+        - paperProfitUsd
+        - liveProfitUsd
         - winRate
         - pairsTracked
         - pathsEvaluated

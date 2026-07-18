@@ -15,4 +15,5 @@ export interface BotConfigInput {
   maxNotionalPerTrade?: number;
   dailyLossLimitUsd?: number;
   useTestnet?: boolean;
+  maxSlippagePct?: number;
 }

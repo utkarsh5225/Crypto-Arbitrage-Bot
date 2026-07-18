@@ -37,6 +37,8 @@ export interface BotConfig {
   dailyLossUsd: number;
   /** Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production */
   useTestnet: boolean;
+  /** Abort a live triangle if a leg fills worse than expected by more than this fraction (0 disables) */
+  maxSlippagePct: number;
 }
 
 export type BotConfigInputTradingMode = typeof BotConfigInputTradingMode[keyof typeof BotConfigInputTradingMode];
@@ -55,6 +57,7 @@ export interface BotConfigInput {
   maxNotionalPerTrade?: number;
   dailyLossLimitUsd?: number;
   useTestnet?: boolean;
+  maxSlippagePct?: number;
 }
 
 export interface CredentialsInput {
@@ -210,8 +213,12 @@ export interface BotStats {
   totalOpportunities: number;
   /** Total trades executed */
   totalTrades: number;
-  /** Cumulative net P&L in USD */
+  /** Cumulative net P&L in USD (paper + live combined) */
   totalProfitUsd: number;
+  /** Cumulative net P&L from paper trades only */
+  paperProfitUsd: number;
+  /** Cumulative net P&L from live trades only */
+  liveProfitUsd: number;
   /** Fraction of trades that were profitable */
   winRate: number;
   /** Number of trading pairs in the price map */

@@ -24,4 +24,6 @@ export interface BotConfig {
   dailyLossUsd: number;
   /** Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production */
   useTestnet: boolean;
+  /** Abort a live triangle if a leg fills worse than expected by more than this fraction (0 disables) */
+  maxSlippagePct: number;
 }

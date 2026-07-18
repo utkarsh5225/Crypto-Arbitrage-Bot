@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { BotStats, ArbitrageOpportunity, PaperTrade } from '@workspace/api-client-react';
 import { getGetStatsQueryKey, getGetOpportunitiesQueryKey, getGetTradesQueryKey } from '@workspace/api-client-react';
+import { getApiToken } from '@/lib/api-token';
 
 // Must match the params used by Dashboard.tsx queries exactly so cache writes land
 // in the same cache slot that the UI reads from.
@@ -85,7 +86,9 @@ export function useBotStream() {
   }, []);
 
   useEffect(() => {
-    const es = new EventSource('/api/stream');
+    // EventSource can't set headers, so pass any auth token as a query param.
+    const token = getApiToken();
+    const es = new EventSource('/api/stream' + (token ? `?token=${encodeURIComponent(token)}` : ''));
 
     es.onopen = () => setConnectionState('open');
     // EventSource auto-reconnects on error; surface that so the UI can warn.
@@ -125,11 +128,16 @@ export function useBotStream() {
         setConnectionState('open');
         setLastStatsAt(Date.now());
         setHistory((prev) => {
+          // Plot the P&L for whichever mode is active, so the curve never mixes
+          // paper and live money.
+          const pnl = stats.tradingMode === 'live'
+            ? (stats.liveProfitUsd ?? 0)
+            : (stats.paperProfitUsd ?? 0);
           const next = [
             ...prev,
             {
               t: Date.now(),
-              pnl: stats.totalProfitUsd ?? 0,
+              pnl,
               oppMin: stats.opportunitiesPerMinute ?? 0,
               pps: stats.pathsPerSecond ?? 0,
             },

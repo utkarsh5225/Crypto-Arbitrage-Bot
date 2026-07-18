@@ -13,8 +13,12 @@ export interface BotStats {
   totalOpportunities: number;
   /** Total trades executed */
   totalTrades: number;
-  /** Cumulative net P&L in USD */
+  /** Cumulative net P&L in USD (paper + live combined) */
   totalProfitUsd: number;
+  /** Cumulative net P&L from paper trades only */
+  paperProfitUsd: number;
+  /** Cumulative net P&L from live trades only */
+  liveProfitUsd: number;
   /** Fraction of trades that were profitable */
   winRate: number;
   /** Number of trading pairs in the price map */

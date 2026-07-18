@@ -17,6 +17,7 @@ import { createClient, type BinanceClient, type BinanceOrderResult } from "./bin
 import { getSymbolFilters } from "./scanner";
 import { type LiveOrder } from "./store";
 import { logger } from "./logger";
+import { roundToStep, roundQuote, sumCommissionInAsset, adverseSlippage } from "./precision";
 
 /**
  * Thrown when a triangle aborts mid-execution. Carries the legs that DID fill,
@@ -53,45 +54,6 @@ export interface LiveTradeResult {
 }
 
 // ---------------------------------------------------------------------------
-// Precision helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Round DOWN a base-asset quantity to the nearest valid lot-size step.
- * If stepSize is 0 (no filter), fall back to `basePrecision` decimal places.
- *
- * Examples:
- *   roundToStep(0.123456789, 0.001, 8) → 0.123   (step = 0.001)
- *   roundToStep(0.123456789, 0,    8) → 0.12345678  (no step, use precision)
- */
-function roundToStep(value: number, stepSize: number, basePrecision: number): number {
-  if (stepSize > 0) {
-    // Count decimal places in stepSize to avoid floating-point drift
-    const stepDecimals = Math.max(0, Math.round(-Math.log10(stepSize)));
-    const factor = Math.pow(10, stepDecimals);
-    return Math.floor(value * factor) / factor;
-  }
-  // No step constraint — use base precision
-  const factor = Math.pow(10, basePrecision);
-  return Math.floor(value * factor) / factor;
-}
-
-/**
- * Round DOWN a quote-asset amount to the number of decimal places
- * specified by the symbol's quotePrecision.
- *
- * Always floor (never round up) to avoid spending more than intended.
- *
- * Examples (BTCUSDT quotePrecision = 8, ETHBTC quotePrecision = 8):
- *   roundQuote(123.4567891, 8) → 123.45678910  (no change needed)
- *   roundQuote(123.4567891, 2) → 123.45         (USDT pairs: 2 decimal places)
- */
-function roundQuote(value: number, quotePrecision: number): number {
-  const factor = Math.pow(10, quotePrecision);
-  return Math.floor(value * factor) / factor;
-}
-
-// ---------------------------------------------------------------------------
 // Average fill price
 // ---------------------------------------------------------------------------
 
@@ -100,24 +62,6 @@ function avgFillPrice(order: BinanceOrderResult): number {
   const quote = parseFloat(order.cummulativeQuoteQty);
   if (qty === 0) return 0;
   return quote / qty;
-}
-
-/**
- * Total commission charged in a specific asset across an order's fills.
- *
- * Binance deducts trading fees either from the asset you receive (which
- * reduces your actual balance) or from BNB (which does not touch the received
- * asset). Only commissions paid in the received asset must be subtracted
- * before threading the amount into the next leg — otherwise the next leg tries
- * to sell more than you hold and Binance rejects it with -2010.
- */
-function commissionInAsset(order: BinanceOrderResult, asset: string): number {
-  if (!order.fills?.length) return 0;
-  let total = 0;
-  for (const f of order.fills) {
-    if (f.commissionAsset === asset) total += parseFloat(f.commission) || 0;
-  }
-  return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +145,10 @@ export async function executeLiveTrade(
   apiKey: string,
   apiSecret: string,
   useTestnet = false,
+  /** Per-leg book prices the opportunity was quoted at (ask for BUY, bid for SELL). */
+  expectedPrices: number[] = [],
+  /** Max adverse slippage per leg before aborting (fraction, e.g. 0.005 = 0.5%). 0 disables. */
+  maxSlippage = 0,
 ): Promise<LiveTradeResult> {
   if (tri.path[0] !== "USDT") {
     throw new Error(
@@ -325,7 +273,7 @@ export async function executeLiveTrade(
     // commission taken from the asset we just received.
     const receivedAsset = tri.path[i + 1];
     const grossReceived = buy ? executedQty : parseFloat(order.cummulativeQuoteQty);
-    const commission = commissionInAsset(order, receivedAsset);
+    const commission = sumCommissionInAsset(order.fills, receivedAsset);
     currentAmount = Math.max(0, grossReceived - commission);
 
     logger.info(
@@ -340,6 +288,35 @@ export async function executeLiveTrade(
       },
       "Live trade leg settled",
     );
+
+    // ── Slippage guard ───────────────────────────────────────────────────────
+    // Market orders can fill worse than the top-of-book price the opportunity
+    // was quoted at. If a non-final leg slipped past the limit, bail out early
+    // and unwind the asset we now hold rather than committing the rest of the
+    // triangle to a trade that is no longer profitable.
+    if (maxSlippage > 0 && i < 2) {
+      const slip = adverseSlippage(buy, expectedPrices[i] ?? 0, fillPrice);
+      if (slip > maxSlippage) {
+        logger.warn(
+          { leg: i + 1, symbol, expected: expectedPrices[i], actual: fillPrice, slip, maxSlippage },
+          "Leg exceeded slippage limit — aborting triangle and unwinding",
+        );
+        const { order: unwindOrder, error } = await attemptUnwind(
+          client,
+          receivedAsset,
+          currentAmount,
+          pathLabel,
+          i + 1,
+        );
+        throw new LiveTradeError(
+          `Leg ${i + 1} (${symbol} ${side}) slippage ${(slip * 100).toFixed(2)}% exceeded limit ${(maxSlippage * 100).toFixed(2)}%`,
+          i + 1,
+          liveOrders,
+          unwindOrder,
+          error,
+        );
+      }
+    }
   }
 
   const netProfitUsd = currentAmount - notionalSize;

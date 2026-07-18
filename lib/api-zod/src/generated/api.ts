@@ -29,7 +29,8 @@ export const GetConfigResponse = zod.object({
   "maxNotionalPerTrade": zod.number().describe('Maximum USDT notional per live trade (safety cap)'),
   "dailyLossLimitUsd": zod.number().describe('Revert to paper mode if realised daily loss exceeds this value'),
   "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)'),
-  "useTestnet": zod.boolean().describe('Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production')
+  "useTestnet": zod.boolean().describe('Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production'),
+  "maxSlippagePct": zod.number().describe('Abort a live triangle if a leg fills worse than expected by more than this fraction (0 disables)')
 })
 
 
@@ -43,7 +44,8 @@ export const UpdateConfigBody = zod.object({
   "tradingMode": zod.enum(['paper', 'live']).optional(),
   "maxNotionalPerTrade": zod.number().optional(),
   "dailyLossLimitUsd": zod.number().optional(),
-  "useTestnet": zod.boolean().optional()
+  "useTestnet": zod.boolean().optional(),
+  "maxSlippagePct": zod.number().optional()
 })
 
 export const UpdateConfigResponse = zod.object({
@@ -54,7 +56,8 @@ export const UpdateConfigResponse = zod.object({
   "maxNotionalPerTrade": zod.number().describe('Maximum USDT notional per live trade (safety cap)'),
   "dailyLossLimitUsd": zod.number().describe('Revert to paper mode if realised daily loss exceeds this value'),
   "dailyLossUsd": zod.number().describe('Current day realised loss in USD (read-only, set by server)'),
-  "useTestnet": zod.boolean().describe('Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production')
+  "useTestnet": zod.boolean().describe('Route live orders and account calls to Binance Spot Testnet (fake funds) instead of production'),
+  "maxSlippagePct": zod.number().describe('Abort a live triangle if a leg fills worse than expected by more than this fraction (0 disables)')
 })
 
 
@@ -146,7 +149,9 @@ export const GetTradesResponse = zod.object({
 export const GetStatsResponse = zod.object({
   "totalOpportunities": zod.number().describe('Total opportunities detected since start'),
   "totalTrades": zod.number().describe('Total trades executed'),
-  "totalProfitUsd": zod.number().describe('Cumulative net P&L in USD'),
+  "totalProfitUsd": zod.number().describe('Cumulative net P&L in USD (paper + live combined)'),
+  "paperProfitUsd": zod.number().describe('Cumulative net P&L from paper trades only'),
+  "liveProfitUsd": zod.number().describe('Cumulative net P&L from live trades only'),
   "winRate": zod.number().describe('Fraction of trades that were profitable'),
   "pairsTracked": zod.number().describe('Number of trading pairs in the price map'),
   "pathsEvaluated": zod.number().describe('Total triangle paths evaluated since start'),

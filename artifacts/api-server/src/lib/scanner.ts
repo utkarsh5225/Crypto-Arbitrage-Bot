@@ -4,6 +4,7 @@ import { store, type TopOpportunity } from "./store";
 import { sseManager } from "./sse-manager";
 import { getCredentials } from "./credentials";
 import { executeLiveTrade, LiveTradeError } from "./live-execution";
+import { checkTriangleMinimums } from "./precision";
 
 interface PriceEntry {
   bid: number;
@@ -98,6 +99,20 @@ let consecutiveLiveFailures = 0;
  * cleared when the trade settles (success or failure).
  */
 let liveTradeInFlight = false;
+
+/** Cleared on graceful shutdown so no new live trades start while draining. */
+let acceptingTrades = true;
+
+/** Stop accepting new live trades (called on SIGTERM before the store flush). */
+export function stopTrading(): void {
+  acceptingTrades = false;
+  logger.info("Scanner will no longer start new live trades (shutdown)");
+}
+
+/** Whether a live trade is currently mid-execution — lets shutdown wait for it. */
+export function isLiveTradeInFlight(): boolean {
+  return liveTradeInFlight;
+}
 
 const priceMap = new Map<string, PriceEntry>();
 let symbolToTriangles = new Map<string, Triangle[]>();
@@ -241,37 +256,10 @@ function findSubMinNotionalLeg(
   prices: number[],
   notional: number,
 ): { leg: number; symbol: string; reason: string; value: number; min: number } | null {
-  let amount = notional;
-  for (let i = 0; i < 3; i++) {
-    const price = prices[i];
-    const filters = getSymbolFilters(tri.symbols[i]);
-    // For a BUY we spend `amount` of the quote asset; for a SELL we receive
-    // `amount * price` of the quote asset. Either way that value is what
-    // Binance measures against minNotional for the leg.
-    const legNotional = tri.buys[i] ? amount : amount * price;
-    if (filters.minNotional > 0 && legNotional < filters.minNotional) {
-      return {
-        leg: i + 1,
-        symbol: tri.symbols[i],
-        reason: "minNotional",
-        value: legNotional,
-        min: filters.minNotional,
-      };
-    }
-    // SELL legs place a quantity-based order in BASE units (`amount`), which is
-    // also subject to the LOT_SIZE minQty floor.
-    if (!tri.buys[i] && filters.minQty > 0 && amount < filters.minQty) {
-      return {
-        leg: i + 1,
-        symbol: tri.symbols[i],
-        reason: "minQty",
-        value: amount,
-        min: filters.minQty,
-      };
-    }
-    amount = tri.buys[i] ? amount / price : amount * price;
-  }
-  return null;
+  const filters = tri.symbols.map((s) => getSymbolFilters(s));
+  const violation = checkTriangleMinimums(tri.buys, prices, notional, filters);
+  if (!violation) return null;
+  return { ...violation, symbol: tri.symbols[violation.leg - 1] };
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +318,8 @@ function checkSymbol(symbol: string): void {
         // Only one live triangle may execute at a time — otherwise concurrent
         // paths double-spend the same USDT bankroll. Skip (without cooldown) so
         // this or another path can fire on the next tick once the lock frees.
-        if (liveTradeInFlight) continue;
+        // Also stop starting new trades once shutdown has begun.
+        if (liveTradeInFlight || !acceptingTrades) continue;
 
         const tradeNotional = Math.min(notionalSize, store.config.maxNotionalPerTrade);
 
@@ -369,6 +358,8 @@ function checkSymbol(symbol: string): void {
           creds.apiKey,
           creds.apiSecret,
           store.config.useTestnet,
+          result.prices,
+          store.config.maxSlippagePct,
         )
           .then((liveResult) => {
             // Success — reset consecutive failure counter
@@ -723,4 +714,13 @@ export async function startScanner(): Promise<void> {
   setInterval(() => {
     sseManager.heartbeat();
   }, 30_000);
+
+  // Periodically refresh exchange info so symbol filters (minNotional, step
+  // sizes) stay current on long-running deployments. Best-effort: a failed
+  // refresh keeps the last-known filters.
+  setInterval(() => {
+    loadExchangeInfo().catch((err) => {
+      logger.warn({ err }, "Periodic exchange-info refresh failed — keeping last-known filters");
+    });
+  }, 60 * 60 * 1000);
 }

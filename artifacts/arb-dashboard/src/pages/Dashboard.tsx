@@ -91,6 +91,7 @@ export default function Dashboard() {
   const [notionalSize, setNotionalSize] = useState('');
   const [maxNotional, setMaxNotional] = useState('');
   const [dailyLossLimit, setDailyLossLimit] = useState('');
+  const [maxSlippage, setMaxSlippage] = useState('');
 
   useEffect(() => {
     if (config) {
@@ -99,6 +100,7 @@ export default function Dashboard() {
       setNotionalSize(config.notionalSize.toString());
       setMaxNotional(config.maxNotionalPerTrade.toString());
       setDailyLossLimit(config.dailyLossLimitUsd.toString());
+      setMaxSlippage(((config.maxSlippagePct ?? 0) * 100).toString());
     }
   }, [config]);
 
@@ -134,6 +136,7 @@ export default function Dashboard() {
         notionalSize: parseFloat(notionalSize),
         maxNotionalPerTrade: parseFloat(maxNotional),
         dailyLossLimitUsd: parseFloat(dailyLossLimit),
+        maxSlippagePct: parseFloat(maxSlippage) / 100,
       },
     }, {
       onSuccess: () => toast.success('Configuration updated'),
@@ -369,9 +372,10 @@ export default function Dashboard() {
       {/* ── Stats Strip ──────────────────────────────────────────────────────── */}
       <div className={cn('grid gap-4', isLive ? 'grid-cols-2 md:grid-cols-6' : 'grid-cols-2 md:grid-cols-5')}>
         <StatCard
-          label="Total P&L"
-          value={formatUsd(stats?.totalProfitUsd)}
-          valueClass={cn((stats?.totalProfitUsd ?? 0) >= 0 ? 'text-green-400' : 'text-destructive')}
+          label={isLive ? 'Live P&L' : 'Paper P&L'}
+          value={formatUsd(isLive ? stats?.liveProfitUsd : stats?.paperProfitUsd)}
+          valueClass={cn(((isLive ? stats?.liveProfitUsd : stats?.paperProfitUsd) ?? 0) >= 0 ? 'text-green-400' : 'text-destructive')}
+          sublabel={stats && stats.totalTrades > 0 ? `Win ${(stats.winRate * 100).toFixed(0)}% · ${stats.totalTrades} trades` : undefined}
         />
         <StatCard label="Total Trades" value={stats?.totalTrades ?? 0} />
         <StatCard label="Opportunities" value={stats?.totalOpportunities ?? 0} />
@@ -565,7 +569,7 @@ export default function Dashboard() {
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1">
                   <ShieldAlert className="h-3 w-3" /> Safety Controls
                 </p>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div className="space-y-1.5">
                     <Label htmlFor="maxNotional" className="text-xs">Max Notional / Trade ($)</Label>
                     <Input id="maxNotional" value={maxNotional} onChange={e => setMaxNotional(e.target.value)} type="number" step="10" className="bg-background/50 h-8 text-xs" />
@@ -573,6 +577,10 @@ export default function Dashboard() {
                   <div className="space-y-1.5">
                     <Label htmlFor="dailyLoss" className="text-xs">Daily Loss Limit ($)</Label>
                     <Input id="dailyLoss" value={dailyLossLimit} onChange={e => setDailyLossLimit(e.target.value)} type="number" step="5" className="bg-background/50 h-8 text-xs" />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="maxSlippage" className="text-xs">Max Slippage (%)</Label>
+                    <Input id="maxSlippage" value={maxSlippage} onChange={e => setMaxSlippage(e.target.value)} type="number" step="0.1" className="bg-background/50 h-8 text-xs" title="Abort a live triangle if a leg fills worse than expected by more than this. 0 disables." />
                   </div>
                 </div>
               </div>

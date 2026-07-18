@@ -11,6 +11,7 @@ export interface BotConfig {
   dailyLossLimitUsd: number;
   dailyLossUsd: number; // read-only; managed internally
   useTestnet: boolean; // route live orders/account to Binance Spot Testnet
+  maxSlippagePct: number; // abort a live triangle if a leg slips past this (0 disables)
 }
 
 export interface ArbitrageOpportunity {
@@ -80,6 +81,9 @@ interface PersistedState {
   totalOpportunities: number;
   totalTrades: number;
   totalProfitUsd: number;
+  winningTrades: number;
+  paperProfitUsd: number;
+  liveProfitUsd: number;
   topToday: TopOpportunity[];
   dailyLossUsd: number;
   tradingMode: "paper" | "live";
@@ -119,6 +123,7 @@ class Store {
     dailyLossLimitUsd: 50,
     dailyLossUsd: 0,
     useTestnet: false,
+    maxSlippagePct: 0.005,
   };
 
   opportunities: ArbitrageOpportunity[] = [];
@@ -128,6 +133,9 @@ class Store {
   totalOpportunities = 0;
   totalTrades = 0;
   totalProfitUsd = 0;
+  winningTrades = 0; // trades with netProfitUsd > 0
+  paperProfitUsd = 0; // cumulative P&L from paper trades only
+  liveProfitUsd = 0; // cumulative P&L from live trades only
   pairsTracked = 0;
   pathsEvaluated = 0;
   scannerConnected = false;
@@ -176,6 +184,9 @@ class Store {
     this.totalOpportunities = saved.totalOpportunities ?? 0;
     this.totalTrades = saved.totalTrades ?? 0;
     this.totalProfitUsd = saved.totalProfitUsd ?? 0;
+    this.winningTrades = saved.winningTrades ?? 0;
+    this.paperProfitUsd = saved.paperProfitUsd ?? 0;
+    this.liveProfitUsd = saved.liveProfitUsd ?? 0;
     this.topToday = saved.topToday ?? [];
     this.currentDay = saved.currentDay ?? new Date().toDateString();
 
@@ -223,6 +234,9 @@ class Store {
         totalOpportunities: this.totalOpportunities,
         totalTrades: this.totalTrades,
         totalProfitUsd: this.totalProfitUsd,
+        winningTrades: this.winningTrades,
+        paperProfitUsd: this.paperProfitUsd,
+        liveProfitUsd: this.liveProfitUsd,
         topToday: this.topToday,
         dailyLossUsd: this.config.dailyLossUsd,
         tradingMode: this.config.tradingMode,
@@ -255,14 +269,30 @@ class Store {
     if (this.trades.length > MAX_TRADES) this.trades.pop();
     this.totalTrades++;
     this.totalProfitUsd += trade.netProfitUsd;
+    if (trade.netProfitUsd > 0) this.winningTrades++;
 
-    // Track daily loss for live trades
-    if (trade.mode === "live" && trade.netProfitUsd < 0) {
-      this.config.dailyLossUsd += Math.abs(trade.netProfitUsd);
+    // Track paper vs live P&L separately so the two are never conflated.
+    if (trade.mode === "live") {
+      this.liveProfitUsd += trade.netProfitUsd;
+      // Track daily loss for live trades
+      if (trade.netProfitUsd < 0) {
+        this.config.dailyLossUsd += Math.abs(trade.netProfitUsd);
+      }
+    } else {
+      this.paperProfitUsd += trade.netProfitUsd;
     }
 
     this._scheduleSave();
     return full;
+  }
+
+  /** Force an immediate synchronous write — used on graceful shutdown. */
+  flush(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this._flushToDisk();
   }
 
   addLiveOrders(orders: LiveOrder[]): void {
@@ -355,7 +385,9 @@ class Store {
       totalOpportunities: this.totalOpportunities,
       totalTrades: this.totalTrades,
       totalProfitUsd: this.totalProfitUsd,
-      winRate: this.totalTrades > 0 ? 1.0 : 0,
+      paperProfitUsd: this.paperProfitUsd,
+      liveProfitUsd: this.liveProfitUsd,
+      winRate: this.totalTrades > 0 ? this.winningTrades / this.totalTrades : 0,
       pairsTracked: this.pairsTracked,
       pathsEvaluated: this.pathsEvaluated,
       pathsPerSecond: Math.round(this.pathsPerSecondValue),

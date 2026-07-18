@@ -23,6 +23,7 @@ router.put("/config", (req, res) => {
     maxNotionalPerTrade?: unknown;
     dailyLossLimitUsd?: unknown;
     useTestnet?: unknown;
+    maxSlippagePct?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -43,6 +44,9 @@ router.put("/config", (req, res) => {
   }
   if (typeof body.dailyLossLimitUsd === "number" && body.dailyLossLimitUsd >= 0) {
     store.config.dailyLossLimitUsd = body.dailyLossLimitUsd;
+  }
+  if (typeof body.maxSlippagePct === "number" && body.maxSlippagePct >= 0 && body.maxSlippagePct < 1) {
+    store.config.maxSlippagePct = body.maxSlippagePct;
   }
 
   // Testnet toggle — only allowed while paper trading, since production and
