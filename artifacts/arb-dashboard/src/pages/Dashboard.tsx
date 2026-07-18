@@ -491,9 +491,14 @@ export default function Dashboard() {
                   </div>
                 </div>
                 {useTestnet && (
-                  <div className="mb-2 text-[10px] text-sky-400/90 bg-sky-500/10 rounded px-2 py-1.5">
-                    Testnet uses separate API keys from{' '}
-                    <code className="select-all">testnet.binance.vision</code> and fake funds — safe for validating live execution.
+                  <div className="mb-2 text-[10px] text-sky-400/90 bg-sky-500/10 rounded px-2 py-1.5 space-y-1">
+                    <p>
+                      Testnet uses separate API keys from{' '}
+                      <code className="select-all">testnet.binance.vision</code> and fake funds — safe for validating live execution.
+                    </p>
+                    <p className="text-sky-400/70">
+                      Note: opportunities are still detected from live mainnet prices, but fills use testnet's thin books — P&amp;L here reflects plumbing, not real market rates.
+                    </p>
                   </div>
                 )}
                 <div className="flex items-center justify-between mb-2">

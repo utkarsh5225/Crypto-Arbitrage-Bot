@@ -21,6 +21,58 @@ const MAINNET_BASE_URL = "https://api.binance.com";
 const TESTNET_BASE_URL = "https://testnet.binance.vision";
 const RECV_WINDOW = 5000;
 
+// ---------------------------------------------------------------------------
+// Server-time synchronisation
+//
+// Signed requests carry a `timestamp` that Binance rejects with error -1021 if
+// it drifts outside recvWindow of the exchange clock. Container clocks can
+// wander, so we sync once per endpoint against GET /api/v3/time (public) and
+// apply the offset to every timestamp, refreshing periodically.
+// ---------------------------------------------------------------------------
+
+const TIME_SYNC_TTL_MS = 5 * 60 * 1000;
+
+/** baseUrl → (serverTime - localTime) in ms. */
+const timeOffsets = new Map<string, number>();
+/** baseUrl → last successful sync timestamp (local ms). */
+const timeSyncedAt = new Map<string, number>();
+/** baseUrl → in-flight sync promise, so concurrent callers share one fetch. */
+const timeSyncInFlight = new Map<string, Promise<void>>();
+
+async function syncServerTime(baseUrl: string): Promise<void> {
+  const res = await fetch(`${baseUrl}/api/v3/time`, {
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`time sync HTTP ${res.status}`);
+  const { serverTime } = (await res.json()) as { serverTime: number };
+  timeOffsets.set(baseUrl, serverTime - Date.now());
+  timeSyncedAt.set(baseUrl, Date.now());
+  logger.debug({ baseUrl, offsetMs: timeOffsets.get(baseUrl) }, "Binance server time synced");
+}
+
+/**
+ * Ensure a fresh-enough clock offset for `baseUrl`. Best-effort: if the sync
+ * fetch fails we log and fall back to the last known (or zero) offset rather
+ * than blocking trading.
+ */
+async function ensureTimeSync(baseUrl: string): Promise<void> {
+  const last = timeSyncedAt.get(baseUrl) ?? 0;
+  if (Date.now() - last < TIME_SYNC_TTL_MS) return;
+
+  let inflight = timeSyncInFlight.get(baseUrl);
+  if (!inflight) {
+    inflight = syncServerTime(baseUrl)
+      .catch((err) => {
+        logger.warn({ err, baseUrl }, "Binance time sync failed — using last known offset");
+      })
+      .finally(() => {
+        timeSyncInFlight.delete(baseUrl);
+      });
+    timeSyncInFlight.set(baseUrl, inflight);
+  }
+  await inflight;
+}
+
 export interface BinanceFill {
   price: string;
   qty: string;
@@ -81,9 +133,13 @@ export class BinanceClient {
     path: string,
     params: Record<string, string | number> = {},
   ): Promise<T> {
+    // Align our timestamp with the exchange clock to avoid -1021 rejections.
+    await ensureTimeSync(this.baseUrl);
+    const offset = timeOffsets.get(this.baseUrl) ?? 0;
+
     const allParams: Record<string, string | number> = {
       ...params,
-      timestamp: Date.now(),
+      timestamp: Date.now() + offset,
       recvWindow: RECV_WINDOW,
     };
 

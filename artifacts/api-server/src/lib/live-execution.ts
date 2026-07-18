@@ -102,6 +102,24 @@ function avgFillPrice(order: BinanceOrderResult): number {
   return quote / qty;
 }
 
+/**
+ * Total commission charged in a specific asset across an order's fills.
+ *
+ * Binance deducts trading fees either from the asset you receive (which
+ * reduces your actual balance) or from BNB (which does not touch the received
+ * asset). Only commissions paid in the received asset must be subtracted
+ * before threading the amount into the next leg — otherwise the next leg tries
+ * to sell more than you hold and Binance rejects it with -2010.
+ */
+function commissionInAsset(order: BinanceOrderResult, asset: string): number {
+  if (!order.fills?.length) return 0;
+  let total = 0;
+  for (const f of order.fills) {
+    if (f.commissionAsset === asset) total += parseFloat(f.commission) || 0;
+  }
+  return total;
+}
+
 // ---------------------------------------------------------------------------
 // Main execution
 // ---------------------------------------------------------------------------
@@ -303,17 +321,23 @@ export async function executeLiveTrade(
       trianglePath: pathLabel,
     });
 
-    // Thread the running amount to the next leg (always the ACTUAL fill)
-    if (buy) {
-      // Received base asset from the BUY
-      currentAmount = executedQty;
-    } else {
-      // Received quote asset from the SELL
-      currentAmount = parseFloat(order.cummulativeQuoteQty);
-    }
+    // Thread the running amount to the next leg — the ACTUAL fill, net of any
+    // commission taken from the asset we just received.
+    const receivedAsset = tri.path[i + 1];
+    const grossReceived = buy ? executedQty : parseFloat(order.cummulativeQuoteQty);
+    const commission = commissionInAsset(order, receivedAsset);
+    currentAmount = Math.max(0, grossReceived - commission);
 
     logger.info(
-      { leg: i + 1, symbol, orderId: order.orderId, outgoingAmount: currentAmount },
+      {
+        leg: i + 1,
+        symbol,
+        orderId: order.orderId,
+        grossReceived,
+        commission,
+        commissionAsset: receivedAsset,
+        outgoingAmount: currentAmount,
+      },
       "Live trade leg settled",
     );
   }

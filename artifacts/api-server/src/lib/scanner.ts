@@ -36,6 +36,11 @@ export interface SymbolFilters {
    * 0 means no minimum was published for the symbol.
    */
   minNotional: number;
+  /**
+   * Minimum BASE quantity from MARKET_LOT_SIZE (or LOT_SIZE fallback), applied
+   * to quantity-based (SELL) orders. 0 means no minimum was published.
+   */
+  minQty: number;
 }
 
 const symbolFilters = new Map<string, SymbolFilters>();
@@ -52,6 +57,7 @@ export function getSymbolFilters(symbol: string): SymbolFilters {
       basePrecision: 8,
       lotStepSize: 0,
       minNotional: 0,
+      minQty: 0,
     }
   );
 }
@@ -84,6 +90,14 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 
 /** Counts back-to-back live trade failures; reset to 0 on any success. */
 let consecutiveLiveFailures = 0;
+
+/**
+ * True while a live triangle is executing. Only one live trade may be in flight
+ * at a time — concurrent triangles would each assume the full notional of USDT
+ * is available and double-spend the same bankroll. Set before firing and
+ * cleared when the trade settles (success or failure).
+ */
+let liveTradeInFlight = false;
 
 const priceMap = new Map<string, PriceEntry>();
 let symbolToTriangles = new Map<string, Triangle[]>();
@@ -226,7 +240,7 @@ function findSubMinNotionalLeg(
   tri: Triangle,
   prices: number[],
   notional: number,
-): { leg: number; symbol: string; legNotional: number; minNotional: number } | null {
+): { leg: number; symbol: string; reason: string; value: number; min: number } | null {
   let amount = notional;
   for (let i = 0; i < 3; i++) {
     const price = prices[i];
@@ -239,8 +253,20 @@ function findSubMinNotionalLeg(
       return {
         leg: i + 1,
         symbol: tri.symbols[i],
-        legNotional,
-        minNotional: filters.minNotional,
+        reason: "minNotional",
+        value: legNotional,
+        min: filters.minNotional,
+      };
+    }
+    // SELL legs place a quantity-based order in BASE units (`amount`), which is
+    // also subject to the LOT_SIZE minQty floor.
+    if (!tri.buys[i] && filters.minQty > 0 && amount < filters.minQty) {
+      return {
+        leg: i + 1,
+        symbol: tri.symbols[i],
+        reason: "minQty",
+        value: amount,
+        min: filters.minQty,
       };
     }
     amount = tri.buys[i] ? amount / price : amount * price;
@@ -301,23 +327,30 @@ function checkSymbol(symbol: string): void {
         sseManager.broadcast("stats", store.getStats());
         // tradingMode is now 'paper'; fall through to paper logic below
       } else {
+        // Only one live triangle may execute at a time — otherwise concurrent
+        // paths double-spend the same USDT bankroll. Skip (without cooldown) so
+        // this or another path can fire on the next tick once the lock frees.
+        if (liveTradeInFlight) continue;
+
         const tradeNotional = Math.min(notionalSize, store.config.maxNotionalPerTrade);
 
-        // Pre-flight MIN_NOTIONAL guard — skip triangles that would be rejected
-        // mid-execution (which would strand an intermediate asset). Applies a
-        // small cooldown so we don't re-evaluate the same failing path every tick.
+        // Pre-flight MIN_NOTIONAL / minQty guard — skip triangles that would be
+        // rejected mid-execution (which would strand an intermediate asset).
+        // Applies a cooldown so we don't re-evaluate the same failing path every tick.
         const subMin = findSubMinNotionalLeg(tri, result.prices, tradeNotional);
         if (subMin) {
           recentlyTraded.set(pathKey, Date.now());
           logger.warn(
             { path: pathKey, ...subMin },
-            "Skipping live trade — leg notional below Binance minimum",
+            "Skipping live trade — leg below Binance minimum",
           );
           continue;
         }
 
-        // Mark cooldown and record opportunity before async execution
+        // Mark cooldown, take the in-flight lock, and record opportunity before
+        // async execution.
         recentlyTraded.set(pathKey, Date.now());
+        liveTradeInFlight = true;
         const opp = store.addOpportunity({
           timestamp: new Date(),
           path: [...tri.path],
@@ -439,6 +472,10 @@ function checkSymbol(symbol: string): void {
                 sseManager.broadcast("stats", store.getStats());
               }
             }
+          })
+          .finally(() => {
+            // Release the lock so the next opportunity can fire.
+            liveTradeInFlight = false;
           });
 
         continue; // Do not fall through to paper trade
@@ -532,6 +569,8 @@ async function loadExchangeInfo(): Promise<boolean> {
       const lot = s.filters.find((f) => f.filterType === "LOT_SIZE");
       const rawStep = marketLot?.stepSize ?? lot?.stepSize ?? "0";
       const lotStepSize = parseFloat(rawStep);
+      const rawMinQty = marketLot?.minQty ?? lot?.minQty ?? "0";
+      const minQty = parseFloat(rawMinQty);
 
       // Minimum order value in the quote asset. Newer exchange info uses the
       // NOTIONAL filter (field `minNotional`); older uses MIN_NOTIONAL.
@@ -546,6 +585,7 @@ async function loadExchangeInfo(): Promise<boolean> {
         basePrecision: s.baseAssetPrecision,
         lotStepSize: isNaN(lotStepSize) ? 0 : lotStepSize,
         minNotional: isNaN(minNotional) ? 0 : minNotional,
+        minQty: isNaN(minQty) ? 0 : minQty,
       });
     }
 
