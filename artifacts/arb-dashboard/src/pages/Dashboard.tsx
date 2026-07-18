@@ -28,17 +28,28 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { ValueFlash } from '@/components/ValueFlash';
+import { PerformanceCharts } from '@/components/PerformanceCharts';
 import { useQueryClient } from '@tanstack/react-query';
 import { formatDistanceToNow } from 'date-fns';
 import {
   Activity, Zap, Settings2, BarChart2, TrendingUp, Trophy,
   ShieldAlert, Key, Wallet, ClipboardList, Power, Eye, EyeOff, AlertTriangle,
+  Bell, BellOff, ChevronRight, ChevronDown,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
 export default function Dashboard() {
   const queryClient = useQueryClient();
-  const { scannerConnected, liveTradeFailure, dismissFailure } = useBotStream();
+  const {
+    scannerConnected,
+    liveTradeFailure,
+    dismissFailure,
+    connectionState,
+    lastStatsAt,
+    history,
+    alertsEnabled,
+    toggleAlerts,
+  } = useBotStream();
 
   // ── Server data ────────────────────────────────────────────────────────────
   const { data: stats } = useGetStats({ query: { queryKey: getGetStatsQueryKey() } });
@@ -50,6 +61,16 @@ export default function Dashboard() {
   const isLive = stats?.tradingMode === 'live';
   const credentialsConfigured = credStatus?.configured ?? false;
   const useTestnet = config?.useTestnet ?? false;
+
+  // Ticking clock so the "updated Xs ago" freshness indicator stays live.
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const secondsSinceUpdate = lastStatsAt ? Math.max(0, Math.floor((now - lastStatsAt) / 1000)) : null;
+  // Stats broadcast every ~2s; flag stale if we've heard nothing for 8s.
+  const dataStale = secondsSinceUpdate !== null && secondsSinceUpdate > 8;
 
   // Account data (live mode only)
   const { data: balancesData, refetch: refetchBalances } = useGetAccountBalances({
@@ -94,6 +115,15 @@ export default function Dashboard() {
 
   // ── Live mode confirmation modal ───────────────────────────────────────────
   const [showLiveConfirm, setShowLiveConfirm] = useState(false);
+
+  // ── Trade Log drill-down (expanded row ids) ────────────────────────────────
+  const [expandedTrades, setExpandedTrades] = useState<Set<string>>(new Set());
+  const toggleTradeExpanded = (id: string) =>
+    setExpandedTrades((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
 
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handleSaveConfig = () => {
@@ -248,11 +278,25 @@ export default function Dashboard() {
             </Button>
           )}
 
+          {/* Alerts toggle — browser notification + sound on live fills/failures */}
+          <button
+            onClick={toggleAlerts}
+            title={alertsEnabled ? 'Alerts on (click to mute)' : 'Enable notification + sound alerts'}
+            className={cn(
+              'h-8 w-8 flex items-center justify-center rounded-md border transition-colors',
+              alertsEnabled
+                ? 'border-primary/40 text-primary bg-primary/10'
+                : 'border-border text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {alertsEnabled ? <Bell className="h-4 w-4" /> : <BellOff className="h-4 w-4" />}
+          </button>
+
           {/* Scanner status */}
-          <div className="flex items-center gap-4 border border-border bg-card px-4 py-2 rounded-md shadow-sm">
-            <div className="flex items-center gap-2 pr-4 border-r border-border">
+          <div className="flex items-center gap-3 sm:gap-4 border border-border bg-card px-3 sm:px-4 py-2 rounded-md shadow-sm">
+            <div className="flex items-center gap-2 pr-3 sm:pr-4 border-r border-border">
               <div className={cn('h-2.5 w-2.5 rounded-full animate-pulse', scannerConnected ? 'bg-green-500' : 'bg-destructive')} />
-              <span className="text-sm uppercase tracking-widest text-muted-foreground">Scanner</span>
+              <span className="text-sm uppercase tracking-widest text-muted-foreground hidden sm:inline">Scanner</span>
               <Badge variant={scannerConnected ? 'success' : 'destructive'} className="ml-1">
                 {scannerConnected ? 'Live' : 'Offline'}
               </Badge>
@@ -266,10 +310,43 @@ export default function Dashboard() {
                 <span className="text-[10px] text-muted-foreground uppercase leading-none">Pairs</span>
                 <ValueFlash value={stats?.pairsTracked ?? 0} className="font-medium" />
               </div>
+              <div className="flex flex-col">
+                <span className="text-[10px] text-muted-foreground uppercase leading-none">Feed</span>
+                <span
+                  className={cn(
+                    'font-medium text-xs',
+                    connectionState === 'reconnecting' || dataStale
+                      ? 'text-amber-400'
+                      : 'text-muted-foreground',
+                  )}
+                >
+                  {connectionState === 'reconnecting'
+                    ? 'reconnecting…'
+                    : secondsSinceUpdate === null
+                      ? 'connecting…'
+                      : dataStale
+                        ? `stale ${secondsSinceUpdate}s`
+                        : `${secondsSinceUpdate}s ago`}
+                </span>
+              </div>
             </div>
           </div>
         </div>
       </header>
+
+      {/* ── Persistent LIVE banner ───────────────────────────────────────────── */}
+      {isLive && (
+        <div
+          className={cn(
+            'flex items-center justify-center gap-2 rounded-md px-4 py-2 text-xs font-bold uppercase tracking-widest border',
+            useTestnet
+              ? 'bg-sky-500/10 border-sky-500/40 text-sky-300'
+              : 'bg-amber-500/10 border-amber-500/50 text-amber-300 animate-pulse',
+          )}
+        >
+          {useTestnet ? '🧪 Live · Testnet — fake funds' : '⚡ Live · Production — real money at risk'}
+        </div>
+      )}
 
       {/* ── Live Trade Failure Banner ────────────────────────────────────────── */}
       {liveTradeFailure && (
@@ -309,6 +386,9 @@ export default function Dashboard() {
           />
         )}
       </div>
+
+      {/* ── Performance Charts ───────────────────────────────────────────────── */}
+      <PerformanceCharts history={history} />
 
       {/* ── Main Grid ────────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 flex-1 min-h-0">
@@ -384,21 +464,68 @@ export default function Dashboard() {
                     <TableRow>
                       <TableCell colSpan={4} className="h-24 text-center text-muted-foreground">No trades executed yet.</TableCell>
                     </TableRow>
-                  ) : trades.map((trade) => (
-                    <TableRow key={trade.id} className="text-xs border-border/40">
-                      <TableCell className="font-medium tracking-tight whitespace-nowrap">{trade.path.join(' → ')}</TableCell>
-                      <TableCell className="text-center">
-                        {trade.mode === 'live'
-                          ? <Badge className="text-[8px] px-1 py-0 h-3.5 bg-amber-500/20 text-amber-400 border-amber-500/30">LIVE</Badge>
-                          : <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 text-muted-foreground">PAPER</Badge>
-                        }
-                      </TableCell>
-                      <TableCell className="text-right text-green-400">{formatPercent(trade.netProfitPct)}</TableCell>
-                      <TableCell className="text-right text-green-400 font-bold bg-green-500/5 px-2">
-                        +{formatUsd(trade.netProfitUsd)}
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                  ) : trades.map((trade) => {
+                    const expanded = expandedTrades.has(trade.id);
+                    const profit = trade.netProfitUsd >= 0;
+                    return (
+                      <React.Fragment key={trade.id}>
+                        <TableRow
+                          className="text-xs border-border/40 cursor-pointer hover:bg-muted/30"
+                          onClick={() => toggleTradeExpanded(trade.id)}
+                        >
+                          <TableCell className="font-medium tracking-tight whitespace-nowrap">
+                            <span className="inline-flex items-center gap-1">
+                              {expanded ? <ChevronDown className="h-3 w-3 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 text-muted-foreground" />}
+                              {trade.path.join(' → ')}
+                            </span>
+                          </TableCell>
+                          <TableCell className="text-center">
+                            {trade.mode === 'live'
+                              ? <Badge className="text-[8px] px-1 py-0 h-3.5 bg-amber-500/20 text-amber-400 border-amber-500/30">LIVE</Badge>
+                              : <Badge variant="outline" className="text-[8px] px-1 py-0 h-3.5 text-muted-foreground">PAPER</Badge>
+                            }
+                          </TableCell>
+                          <TableCell className={cn('text-right', profit ? 'text-green-400' : 'text-destructive')}>{formatPercent(trade.netProfitPct)}</TableCell>
+                          <TableCell className={cn('text-right font-bold px-2', profit ? 'text-green-400 bg-green-500/5' : 'text-destructive bg-destructive/5')}>
+                            {profit ? '+' : '-'}{formatUsd(Math.abs(trade.netProfitUsd))}
+                          </TableCell>
+                        </TableRow>
+                        {expanded && (
+                          <TableRow className="border-border/40 bg-background/40">
+                            <TableCell colSpan={4} className="py-2">
+                              <div className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5 flex flex-wrap gap-x-4 gap-y-0.5">
+                                <span>Notional: <span className="text-foreground font-mono">{formatUsd(trade.notionalSize)}</span></span>
+                                <span>Gross: <span className="text-foreground font-mono">{formatUsd(trade.grossProfitUsd)}</span></span>
+                                <span>When: <span className="text-foreground">{formatRelativeTime(trade.timestamp)}</span></span>
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                                {(trade.symbols ?? []).map((sym, i) => (
+                                  <div key={i} className="rounded border border-border/60 bg-card/50 px-2 py-1.5">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-[9px] text-muted-foreground uppercase">Leg {i + 1}</span>
+                                      <span className="font-mono text-xs text-foreground">{sym}</span>
+                                    </div>
+                                    <div className="mt-1 flex items-center justify-between text-[10px] text-muted-foreground">
+                                      <span>Price</span>
+                                      <span className="font-mono text-foreground">
+                                        {(trade.fillPrices?.[i] ?? trade.prices?.[i])?.toFixed?.(6) ?? '—'}
+                                      </span>
+                                    </div>
+                                    {trade.orderIds?.[i] !== undefined && (
+                                      <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                                        <span>Order</span>
+                                        <span className="font-mono text-foreground">#{trade.orderIds[i]}</span>
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
                 </TableBody>
               </Table>
             </CardContent>
@@ -417,7 +544,7 @@ export default function Dashboard() {
               {/* Algorithm Settings */}
               <div>
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Algorithm</p>
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div className="space-y-1.5">
                     <Label htmlFor="notionalSize" className="text-xs">Notional ($)</Label>
                     <Input id="notionalSize" value={notionalSize} onChange={e => setNotionalSize(e.target.value)} type="number" step="10" className="bg-background/50 h-8 text-xs" />
@@ -438,7 +565,7 @@ export default function Dashboard() {
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1">
                   <ShieldAlert className="h-3 w-3" /> Safety Controls
                 </p>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div className="space-y-1.5">
                     <Label htmlFor="maxNotional" className="text-xs">Max Notional / Trade ($)</Label>
                     <Input id="maxNotional" value={maxNotional} onChange={e => setMaxNotional(e.target.value)} type="number" step="10" className="bg-background/50 h-8 text-xs" />
@@ -655,7 +782,7 @@ function TopOpportunitiesCard({
         </div>
         <Badge variant="outline" className="text-[10px] bg-background">Top 5</Badge>
       </CardHeader>
-      <CardContent className="p-0">
+      <CardContent className="p-0 overflow-x-auto">
         <Table>
           <TableHeader className="sticky top-0 bg-card z-10 border-b border-border">
             <TableRow className="hover:bg-transparent">
@@ -719,7 +846,7 @@ function AccountBalancesPanel({
           <div className="text-sm font-bold text-amber-400">{formatUsd(totalUsdtValue)}</div>
         </div>
       </CardHeader>
-      <CardContent className="p-0">
+      <CardContent className="p-0 overflow-x-auto">
         <Table>
           <TableHeader className="sticky top-0 bg-card z-10 border-b border-border">
             <TableRow className="hover:bg-transparent">
@@ -770,7 +897,7 @@ function OrderHistoryPanel({ orders }: { orders: LiveOrder[] }) {
         </div>
         <Badge variant="outline" className="text-[10px] bg-background">Last 20</Badge>
       </CardHeader>
-      <CardContent className="p-0">
+      <CardContent className="p-0 overflow-x-auto">
         <Table>
           <TableHeader className="sticky top-0 bg-card z-10 border-b border-border">
             <TableRow className="hover:bg-transparent">
