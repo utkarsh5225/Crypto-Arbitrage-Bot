@@ -336,6 +336,20 @@ function checkSymbol(symbol: string): void {
           continue;
         }
 
+        // Unwind-safety: only trade triangles whose intermediate assets each have
+        // a direct {asset}USDT pair, so a mid-triangle failure can always be
+        // converted back to USDT instead of stranding an unrecoverable position.
+        const midAsset = tri.path[1];
+        const endAsset = tri.path[2];
+        if (!symbolFilters.has(`${midAsset}USDT`) || !symbolFilters.has(`${endAsset}USDT`)) {
+          recentlyTraded.set(pathKey, Date.now());
+          logger.warn(
+            { path: pathKey, midAsset, endAsset },
+            "Skipping live trade — intermediate asset has no direct USDT unwind pair",
+          );
+          continue;
+        }
+
         // Mark cooldown, take the in-flight lock, and record opportunity before
         // async execution.
         recentlyTraded.set(pathKey, Date.now());

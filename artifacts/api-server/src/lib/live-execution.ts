@@ -9,15 +9,41 @@
  * Safety rules:
  *  - Only USDT-starting triangles are supported (the first leg always spends USDT,
  *    so the initial notional is unambiguous)
- *  - Any single-leg failure aborts the remaining legs (no auto-unwind)
+ *  - A pre-trade balance check ensures enough USDT is available before firing
+ *  - A single-leg failure aborts the remaining legs and best-effort unwinds any
+ *    stranded intermediate asset back to USDT
  *  - Daily loss limit is checked before execution; see scanner.ts
  */
 
-import { createClient, type BinanceClient, type BinanceOrderResult } from "./binance-client";
-import { getSymbolFilters } from "./scanner";
+import { createClient, type BinanceOrderResult, type BinanceAccount } from "./binance-client";
+import { getSymbolFilters, type SymbolFilters } from "./scanner";
 import { type LiveOrder } from "./store";
 import { logger } from "./logger";
 import { roundToStep, roundQuote, sumCommissionInAsset, adverseSlippage } from "./precision";
+
+/**
+ * The subset of the Binance client the executor needs. Declared as an interface
+ * so tests can inject a fake without touching the network.
+ */
+export interface ExecClient {
+  placeMarketOrder(
+    symbol: string,
+    side: "BUY" | "SELL",
+    qty: { quoteOrderQty: number } | { quantity: number },
+  ): Promise<BinanceOrderResult>;
+  getAccount(): Promise<BinanceAccount>;
+}
+
+/** Injectable dependencies — real implementations by default, fakes in tests. */
+export interface ExecutionDeps {
+  makeClient: (apiKey: string, apiSecret: string, useTestnet: boolean) => ExecClient;
+  getFilters: (symbol: string) => SymbolFilters;
+}
+
+const defaultDeps: ExecutionDeps = {
+  makeClient: (apiKey, apiSecret, useTestnet) => createClient(apiKey, apiSecret, useTestnet),
+  getFilters: getSymbolFilters,
+};
 
 /**
  * Thrown when a triangle aborts mid-execution. Carries the legs that DID fill,
@@ -87,11 +113,12 @@ function avgFillPrice(order: BinanceOrderResult): number {
  * original leg failure, so it only ever returns null instead of throwing.
  */
 async function attemptUnwind(
-  client: BinanceClient,
+  client: ExecClient,
   asset: string,
   amount: number,
   pathLabel: string,
   failedLeg: number,
+  getFilters: ExecutionDeps["getFilters"],
 ): Promise<{ order: LiveOrder | null; error?: string }> {
   if (asset === "USDT") {
     // Nothing was converted yet (leg 1 failed) — no position to unwind.
@@ -99,7 +126,7 @@ async function attemptUnwind(
   }
 
   const symbol = `${asset}USDT`;
-  const filters = getSymbolFilters(symbol);
+  const filters = getFilters(symbol);
   const qty = roundToStep(amount, filters.lotStepSize, filters.basePrecision);
 
   if (qty <= 0) {
@@ -149,6 +176,7 @@ export async function executeLiveTrade(
   expectedPrices: number[] = [],
   /** Max adverse slippage per leg before aborting (fraction, e.g. 0.005 = 0.5%). 0 disables. */
   maxSlippage = 0,
+  deps: ExecutionDeps = defaultDeps,
 ): Promise<LiveTradeResult> {
   if (tri.path[0] !== "USDT") {
     throw new Error(
@@ -156,10 +184,30 @@ export async function executeLiveTrade(
     );
   }
 
-  const client = createClient(apiKey, apiSecret, useTestnet);
+  const client = deps.makeClient(apiKey, apiSecret, useTestnet);
   const orderIds: number[] = [];
   const fillPrices: number[] = [];
   const liveOrders: LiveOrder[] = [];
+
+  // ── Pre-trade balance check ────────────────────────────────────────────────
+  // Confirm the account actually holds enough USDT before placing any order, so
+  // we fail fast with a clear reason instead of a cryptic -2010 on leg 1.
+  let account: BinanceAccount;
+  try {
+    account = await client.getAccount();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new LiveTradeError(`Pre-trade balance check failed: ${msg}`, 0, [], null);
+  }
+  const usdtFree = parseFloat(account.balances.find((b) => b.asset === "USDT")?.free ?? "0");
+  if (usdtFree < notionalSize) {
+    throw new LiveTradeError(
+      `Insufficient USDT balance: have ${usdtFree.toFixed(2)}, need ${notionalSize.toFixed(2)}`,
+      0,
+      [],
+      null,
+    );
+  }
 
   let currentAmount = notionalSize; // starts as USDT
   const pathLabel = tri.path.join("→");
@@ -168,7 +216,7 @@ export async function executeLiveTrade(
     const symbol = tri.symbols[i];
     const buy = tri.buys[i];
     const side = buy ? "BUY" : "SELL";
-    const filters = getSymbolFilters(symbol);
+    const filters = deps.getFilters(symbol);
     // Asset held going INTO this leg — what would be stranded if the leg fails.
     const heldAsset = tri.path[i];
 
@@ -180,6 +228,7 @@ export async function executeLiveTrade(
         currentAmount,
         pathLabel,
         i + 1,
+        deps.getFilters,
       );
       throw new LiveTradeError(
         `Leg ${i + 1} (${symbol} ${side}) failed: ${reason}`,
@@ -307,6 +356,7 @@ export async function executeLiveTrade(
           currentAmount,
           pathLabel,
           i + 1,
+          deps.getFilters,
         );
         throw new LiveTradeError(
           `Leg ${i + 1} (${symbol} ${side}) slippage ${(slip * 100).toFixed(2)}% exceeded limit ${(maxSlippage * 100).toFixed(2)}%`,
