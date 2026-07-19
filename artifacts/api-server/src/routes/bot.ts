@@ -12,6 +12,10 @@ router.post("/bot/kill", (_req, res) => {
 
   logger.warn("Kill switch triggered — reverted to paper mode");
 
+  // Persist immediately — a kill switch that a restart could undo is not a
+  // kill switch.
+  store.persistConfig();
+
   // Broadcast updated stats so dashboard reflects mode change immediately
   sseManager.broadcast("stats", store.getStats());
 

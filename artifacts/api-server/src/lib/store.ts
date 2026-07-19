@@ -96,6 +96,13 @@ interface PersistedState {
   tradingMode: "paper" | "live";
   useTestnet: boolean;
   currentDay: string;
+  /**
+   * Full operator config (sizing + safety limits). Optional so older store.json
+   * files without it still load; missing fields fall back to code defaults.
+   * Without this, a restart silently reverted notional/limits to defaults while
+   * staying in whatever trading mode was saved.
+   */
+  config?: Partial<BotConfig>;
 }
 
 function loadPersistedState(): PersistedState | null {
@@ -198,6 +205,15 @@ class Store {
     this.topToday = saved.topToday ?? [];
     this.currentDay = saved.currentDay ?? new Date().toDateString();
 
+    // Restore the operator config (sizing + safety limits) on top of the code
+    // defaults, so a restart cannot silently widen notional or loss limits.
+    // Merged (not replaced) so fields added in later versions keep their default.
+    // The dailyLossUsd / tradingMode / useTestnet blocks below still run and take
+    // precedence — they carry extra logic (day-boundary reset, explicit restore).
+    if (saved.config) {
+      this.config = { ...this.config, ...saved.config };
+    }
+
     // Restore daily loss tracking — reset at day boundary
     const today = new Date().toDateString();
     if (saved.currentDay === today) {
@@ -250,6 +266,7 @@ class Store {
         tradingMode: this.config.tradingMode,
         useTestnet: this.config.useTestnet,
         currentDay: this.currentDay,
+        config: this.config,
       };
       writeFileSync(DATA_FILE, JSON.stringify(state), "utf-8");
     } catch (err) {
@@ -347,6 +364,15 @@ class Store {
       return true; // Limit hit — caller should broadcast alert
     }
     return false;
+  }
+
+  /**
+   * Persist the config after an operator change. Routes that mutate
+   * `store.config` directly must call this, otherwise the change lives only in
+   * memory and is lost on the next restart.
+   */
+  persistConfig(): void {
+    this._scheduleSave();
   }
 
   /**

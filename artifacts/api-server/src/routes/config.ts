@@ -96,6 +96,10 @@ router.put("/config", (req, res) => {
     logger.info({ tradingMode: body.tradingMode }, "Trading mode changed");
   }
 
+  // Durably save sizing/safety limits — otherwise a restart silently reverts
+  // them to code defaults (e.g. notional back to 1000) while staying live.
+  store.persistConfig();
+
   res.json(store.config);
 });
 
