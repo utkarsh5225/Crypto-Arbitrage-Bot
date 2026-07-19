@@ -115,6 +115,43 @@ export default function Dashboard() {
     fetch('/api/my-ip').then(r => r.json()).then(d => setServerIp(d.ip)).catch(() => {});
   }, []);
 
+  // ── DeepSeek (LLM) API key ─────────────────────────────────────────────────
+  // Raw fetch: these endpoints are not in the generated api-client. The key is
+  // sent once and never read back — the server only ever returns a masked form.
+  const [llmKeyInput, setLlmKeyInput] = useState('');
+  const [showLlmKey, setShowLlmKey] = useState(false);
+  const [llmSaving, setLlmSaving] = useState(false);
+  const [llmStatus, setLlmStatus] = useState<{ configured: boolean; maskedKey?: string; model?: string }>({ configured: false });
+
+  const refetchLlm = useCallback(() => {
+    fetch('/api/config/llm').then(r => r.json()).then(setLlmStatus).catch(() => {});
+  }, []);
+  useEffect(() => { refetchLlm(); }, [refetchLlm]);
+
+  const handleSaveLlmKey = () => {
+    setLlmSaving(true);
+    fetch('/api/config/llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: llmKeyInput.trim() }),
+    })
+      .then(async (r) => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Validation failed');
+        toast.success(`DeepSeek key validated and saved (${d.maskedKey})`);
+        setLlmKeyInput('');          // never keep the secret in component state
+        refetchLlm();
+      })
+      .catch((err) => toast.error(err?.message ?? 'Could not save DeepSeek key'))
+      .finally(() => setLlmSaving(false));
+  };
+
+  const handleClearLlmKey = () => {
+    fetch('/api/config/llm', { method: 'DELETE' })
+      .then(() => { toast.success('DeepSeek key removed'); refetchLlm(); })
+      .catch(() => toast.error('Could not remove key'));
+  };
+
   // ── Live mode confirmation modal ───────────────────────────────────────────
   const [showLiveConfirm, setShowLiveConfirm] = useState(false);
 
@@ -735,6 +772,58 @@ export default function Dashboard() {
                   >
                     {setCredentialsMutation.isPending ? 'Validating...' : 'Save & Validate'}
                   </Button>
+                </div>
+              </div>
+
+              {/* DeepSeek (LLM) API key */}
+              <div className="border-t border-border pt-4">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
+                    <Key className="h-3 w-3" /> DeepSeek API Key
+                  </p>
+                  {llmStatus.configured
+                    ? <span className="text-[10px] text-green-400 font-mono">✓ {llmStatus.maskedKey}</span>
+                    : <span className="text-[10px] text-muted-foreground">Not configured</span>
+                  }
+                </div>
+                <div className="mb-2 text-[10px] text-muted-foreground bg-muted/30 rounded px-2 py-1.5 leading-relaxed">
+                  Stored encrypted (AES-256-GCM), never logged, never returned in full.
+                  Validated against DeepSeek on save.
+                </div>
+                <div className="grid grid-cols-1 gap-2">
+                  <div className="relative">
+                    <Input
+                      placeholder="sk-..."
+                      value={llmKeyInput}
+                      onChange={e => setLlmKeyInput(e.target.value)}
+                      type={showLlmKey ? 'text' : 'password'}
+                      className="bg-background/50 h-8 text-xs pr-8 font-mono"
+                    />
+                    <button onClick={() => setShowLlmKey(v => !v)} className="absolute right-2 top-1.5 text-muted-foreground hover:text-foreground">
+                      {showLlmKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    </button>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={handleSaveLlmKey}
+                      disabled={llmSaving || !llmKeyInput.trim()}
+                      size="sm"
+                      variant="outline"
+                      className="h-8 text-xs font-bold flex-1"
+                    >
+                      {llmSaving ? 'Validating...' : 'Save & Validate'}
+                    </Button>
+                    {llmStatus.configured && (
+                      <Button
+                        onClick={handleClearLlmKey}
+                        size="sm"
+                        variant="outline"
+                        className="h-8 text-xs text-destructive hover:text-destructive"
+                      >
+                        Remove
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </div>
             </CardContent>

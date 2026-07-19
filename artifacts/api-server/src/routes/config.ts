@@ -6,6 +6,14 @@ import {
   setCredentials,
 } from "../lib/credentials";
 import { createClient } from "../lib/binance-client";
+import {
+  hasLlmCredentials,
+  getMaskedLlmKey,
+  setLlmCredentials,
+  clearLlmCredentials,
+  testLlmCredentials,
+  DEFAULT_MODEL,
+} from "../lib/llm-credentials";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
@@ -159,6 +167,55 @@ router.post("/config/credentials", async (req, res) => {
     maskedKey: getMaskedKey(),
     warning: result.canTrade ? undefined : "Credentials saved, but Spot Trading is not enabled on this API key. Enable it in Binance → API Management to place live orders.",
   });
+});
+
+// ---------------------------------------------------------------------------
+// DeepSeek (LLM) API key — same handling rules as the Binance keys: encrypted
+// at rest, never logged, never returned in full.
+// ---------------------------------------------------------------------------
+
+/** GET /api/config/llm — status only, never the key itself */
+router.get("/config/llm", (_req, res) => {
+  res.json({
+    configured: hasLlmCredentials(),
+    maskedKey: getMaskedLlmKey(),
+    model: DEFAULT_MODEL,
+  });
+});
+
+/** POST /api/config/llm — validate against DeepSeek, then store encrypted */
+router.post("/config/llm", async (req, res) => {
+  const body = req.body as { apiKey?: unknown };
+  if (typeof body.apiKey !== "string" || body.apiKey.trim().length === 0) {
+    res.status(400).json({ error: "apiKey is required" });
+    return;
+  }
+  const apiKey = body.apiKey.trim();
+
+  const result = await testLlmCredentials(apiKey);
+  if (!result.valid) {
+    // result.error never contains the key.
+    res.status(401).json({ error: `DeepSeek rejected the key: ${result.error}` });
+    return;
+  }
+
+  setLlmCredentials(apiKey);
+  // Log the outcome only — never the key or any part of it.
+  logger.info({ models: result.models }, "DeepSeek API key saved and validated");
+
+  res.json({
+    configured: true,
+    maskedKey: getMaskedLlmKey(),
+    model: DEFAULT_MODEL,
+    models: result.models,
+  });
+});
+
+/** DELETE /api/config/llm — remove the stored key */
+router.delete("/config/llm", (_req, res) => {
+  clearLlmCredentials();
+  logger.info("DeepSeek API key cleared");
+  res.json({ configured: false });
 });
 
 export default router;
