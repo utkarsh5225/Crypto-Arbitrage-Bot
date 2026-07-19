@@ -19,6 +19,17 @@ export interface BotConfig {
    * `minProfitThreshold + slippageBudgetPct`.
    */
   slippageBudgetPct: number;
+  /**
+   * Reject a triangle if any of its three legs was quoted more than this many
+   * milliseconds ago (0 disables).
+   *
+   * The scanner re-evaluates a triangle whenever any ONE leg ticks, reading the
+   * other two from cache. On an illiquid pair that has not traded in a while,
+   * that compares a live price against a stale one — which manufactures a
+   * phantom edge roughly equal to the price drift. Requiring all three legs to
+   * be recent is what makes a quoted edge meaningful.
+   */
+  maxQuoteAgeMs: number;
 }
 
 export interface ArbitrageOpportunity {
@@ -39,6 +50,12 @@ export interface ArbitrageOpportunity {
    * undefined for paper opportunities, which take no depth snapshot.
    */
   depthNetPct?: number | null;
+  /**
+   * Age (ms) of the STALEST of the three legs' quotes when this was evaluated.
+   * A large value means the "edge" is likely an artifact of comparing a fresh
+   * price against an out-of-date one rather than a real dislocation.
+   */
+  maxLegAgeMs?: number;
 }
 
 export interface PaperTrade {
@@ -148,6 +165,7 @@ class Store {
     useTestnet: false,
     maxSlippagePct: 0.005,
     slippageBudgetPct: 0.002,
+    maxQuoteAgeMs: 1000,
   };
 
   opportunities: ArbitrageOpportunity[] = [];

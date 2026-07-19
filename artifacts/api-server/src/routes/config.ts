@@ -25,6 +25,7 @@ router.put("/config", (req, res) => {
     useTestnet?: unknown;
     maxSlippagePct?: unknown;
     slippageBudgetPct?: unknown;
+    maxQuoteAgeMs?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -68,6 +69,10 @@ router.put("/config", (req, res) => {
     body.slippageBudgetPct < 1
   ) {
     store.config.slippageBudgetPct = body.slippageBudgetPct;
+  }
+  // Max age of the stalest leg's quote before a triangle is rejected (0 = off).
+  if (typeof body.maxQuoteAgeMs === "number" && body.maxQuoteAgeMs >= 0) {
+    store.config.maxQuoteAgeMs = body.maxQuoteAgeMs;
   }
 
   // Testnet toggle — only allowed while paper trading, since production and

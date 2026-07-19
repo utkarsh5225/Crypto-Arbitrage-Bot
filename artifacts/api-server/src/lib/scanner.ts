@@ -10,6 +10,8 @@ import { checkTriangleMinimums, simulateTriangleVWAP } from "./precision";
 interface PriceEntry {
   bid: number;
   ask: number;
+  /** Date.now() when this quote arrived — used to reject stale legs. */
+  ts: number;
 }
 
 interface TradingPair {
@@ -251,14 +253,22 @@ function buildIndex(pairs: TradingPair[]): Map<string, Triangle[]> {
 
 function evalTriangle(
   tri: Triangle,
-): { grossPct: number; netPct: number; prices: number[] } | null {
+): { grossPct: number; netPct: number; prices: number[]; maxLegAgeMs: number } | null {
   const { feeRate } = store.config;
   let amount = 1.0;
   const prices: number[] = [];
+  // Track the STALEST leg. A triangle is only meaningful if all three quotes
+  // describe roughly the same instant; mixing a fresh price with an old one
+  // fabricates an edge equal to the drift between them.
+  const now = Date.now();
+  let maxLegAgeMs = 0;
 
   for (let i = 0; i < 3; i++) {
     const entry = priceMap.get(tri.symbols[i]);
     if (!entry || entry.ask === 0 || entry.bid === 0) return null;
+
+    const ageMs = now - entry.ts;
+    if (ageMs > maxLegAgeMs) maxLegAgeMs = ageMs;
 
     if (tri.buys[i]) {
       prices.push(entry.ask);
@@ -271,7 +281,7 @@ function evalTriangle(
 
   const grossPct = amount - 1;
   const netPct = grossPct - 3 * feeRate;
-  return { grossPct, netPct, prices };
+  return { grossPct, netPct, prices, maxLegAgeMs };
 }
 
 /**
@@ -356,6 +366,27 @@ function checkSymbol(symbol: string): void {
         // Also stop starting new trades once shutdown has begun.
         if (liveTradeInFlight || !acceptingTrades) continue;
 
+        // Freshness gate: every leg must have been quoted recently. The scanner
+        // re-evaluates a triangle when any ONE leg ticks, reading the other two
+        // from cache — so a freshly-ticked liquid leg paired with an illiquid
+        // leg's seconds-old price manufactures a phantom edge roughly equal to
+        // the drift between them. Rejecting here (before the depth snapshot)
+        // also saves three REST calls per phantom.
+        const { maxQuoteAgeMs } = store.config;
+        if (maxQuoteAgeMs > 0 && result.maxLegAgeMs > maxQuoteAgeMs) {
+          recentlyTraded.set(pathKey, Date.now());
+          logger.warn(
+            {
+              path: pathKey,
+              maxLegAgeMs: result.maxLegAgeMs,
+              maxQuoteAgeMs,
+              netPct: result.netPct,
+            },
+            "Skipping live trade — stale quote on at least one leg",
+          );
+          continue;
+        }
+
         const tradeNotional = Math.min(notionalSize, store.config.maxNotionalPerTrade);
 
         // Pre-flight MIN_NOTIONAL / minQty guard — skip triangles that would be
@@ -427,6 +458,7 @@ function checkSymbol(symbol: string): void {
       grossProfitPct: result.grossPct,
       netProfitPct: result.netPct,
       wasPaperTraded: false,
+      maxLegAgeMs: result.maxLegAgeMs,
     });
 
     const trade = store.addTrade({
@@ -513,7 +545,7 @@ async function fireLiveTrade(
   tri: Triangle,
   tradeNotional: number,
   creds: { apiKey: string; apiSecret: string },
-  result: { grossPct: number; netPct: number; prices: number[] },
+  result: { grossPct: number; netPct: number; prices: number[]; maxLegAgeMs: number },
 ): Promise<void> {
   const opp = store.addOpportunity({
     timestamp: new Date(),
@@ -523,6 +555,7 @@ async function fireLiveTrade(
     grossProfitPct: result.grossPct,
     netProfitPct: result.netPct,
     wasPaperTraded: false,
+    maxLegAgeMs: result.maxLegAgeMs,
   });
 
   try {
@@ -759,7 +792,7 @@ function handleMessage(raw: Buffer): void {
     const bid = parseFloat(msg.b!);
     const ask = parseFloat(msg.a!);
     if (!isNaN(bid) && !isNaN(ask)) {
-      priceMap.set(msg.s, { bid, ask });
+      priceMap.set(msg.s, { bid, ask, ts: Date.now() });
       if (exchangeInfoLoaded) checkSymbol(msg.s);
     }
   } catch {

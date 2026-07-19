@@ -427,17 +427,21 @@ export default function Dashboard() {
                   <TableHead className="text-right">Gross</TableHead>
                   <TableHead className="text-right" title="Top-of-book estimate — assumes you get the quoted price on all 3 legs">Net (quoted)</TableHead>
                   <TableHead className="text-right" title="The honest number: net edge after walking real order-book depth and paying fees on all 3 legs. This is what the bot actually decides on.">Real (depth)</TableHead>
+                  <TableHead className="text-right" title="Age of the stalest of the 3 legs' quotes. A large value means the edge is likely an artifact of comparing a fresh price against an out-of-date one, not a real dislocation.">Age</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {opportunities.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={5} className="h-24 text-center text-muted-foreground">No opportunities detected yet.</TableCell>
+                    <TableCell colSpan={6} className="h-24 text-center text-muted-foreground">No opportunities detected yet.</TableCell>
                   </TableRow>
                 ) : opportunities.map((opp) => {
                   // Present only on live-mode candidates that reached the depth gate.
-                  const depthNetPct = (opp as unknown as { depthNetPct?: number | null }).depthNetPct;
+                  const extra = opp as unknown as { depthNetPct?: number | null; maxLegAgeMs?: number };
+                  const depthNetPct = extra.depthNetPct;
                   const hasDepth = typeof depthNetPct === 'number';
+                  const ageMs = extra.maxLegAgeMs;
+                  const hasAge = typeof ageMs === 'number';
                   return (
                   <TableRow key={opp.id} className="group text-xs border-border/40">
                     <TableCell className="text-muted-foreground whitespace-nowrap">{formatRelativeTime(opp.timestamp)}</TableCell>
@@ -460,6 +464,16 @@ export default function Dashboard() {
                       title={hasDepth ? undefined : 'Not depth-checked (paper mode, or skipped before the depth gate)'}
                     >
                       {hasDepth ? formatPercent(depthNetPct!) : '—'}
+                    </TableCell>
+                    <TableCell
+                      className={cn(
+                        'text-right whitespace-nowrap tabular-nums',
+                        !hasAge ? 'text-muted-foreground/50'
+                          : ageMs! > 1000 ? 'text-red-400' : 'text-muted-foreground',
+                      )}
+                      title={hasAge && ageMs! > 1000 ? 'Stale — this edge is likely a timing artifact' : undefined}
+                    >
+                      {hasAge ? (ageMs! < 1000 ? `${ageMs}ms` : `${(ageMs! / 1000).toFixed(1)}s`) : '—'}
                     </TableCell>
                   </TableRow>
                   );
