@@ -425,15 +425,20 @@ export default function Dashboard() {
                   <TableHead className="w-[90px]">Time</TableHead>
                   <TableHead>Path</TableHead>
                   <TableHead className="text-right">Gross</TableHead>
-                  <TableHead className="text-right">Net</TableHead>
+                  <TableHead className="text-right" title="Top-of-book estimate — assumes you get the quoted price on all 3 legs">Net (quoted)</TableHead>
+                  <TableHead className="text-right" title="The honest number: net edge after walking real order-book depth and paying fees on all 3 legs. This is what the bot actually decides on.">Real (depth)</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {opportunities.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={4} className="h-24 text-center text-muted-foreground">No opportunities detected yet.</TableCell>
+                    <TableCell colSpan={5} className="h-24 text-center text-muted-foreground">No opportunities detected yet.</TableCell>
                   </TableRow>
-                ) : opportunities.map((opp) => (
+                ) : opportunities.map((opp) => {
+                  // Present only on live-mode candidates that reached the depth gate.
+                  const depthNetPct = (opp as unknown as { depthNetPct?: number | null }).depthNetPct;
+                  const hasDepth = typeof depthNetPct === 'number';
+                  return (
                   <TableRow key={opp.id} className="group text-xs border-border/40">
                     <TableCell className="text-muted-foreground whitespace-nowrap">{formatRelativeTime(opp.timestamp)}</TableCell>
                     <TableCell className="font-medium tracking-tight whitespace-nowrap">
@@ -443,11 +448,22 @@ export default function Dashboard() {
                     <TableCell className="text-right whitespace-nowrap">
                       <ValueFlash value={formatPercent(opp.grossProfitPct)} type="number" />
                     </TableCell>
-                    <TableCell className={cn('text-right font-medium whitespace-nowrap', opp.netProfitPct > 0 ? 'text-green-400' : 'text-muted-foreground')}>
+                    <TableCell className={cn('text-right whitespace-nowrap', opp.netProfitPct > 0 ? 'text-muted-foreground' : 'text-muted-foreground')}>
                       <ValueFlash value={formatPercent(opp.netProfitPct)} type="number" />
                     </TableCell>
+                    <TableCell
+                      className={cn(
+                        'text-right font-bold whitespace-nowrap',
+                        !hasDepth ? 'text-muted-foreground/50'
+                          : depthNetPct! > 0 ? 'text-green-400' : 'text-red-400',
+                      )}
+                      title={hasDepth ? undefined : 'Not depth-checked (paper mode, or skipped before the depth gate)'}
+                    >
+                      {hasDepth ? formatPercent(depthNetPct!) : '—'}
+                    </TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </CardContent>

@@ -528,6 +528,12 @@ async function fireLiveTrade(
   try {
     // ── Depth-aware entry gate ──────────────────────────────────────────────
     const gate = await evaluateDepthGate(tri, tradeNotional, creds);
+
+    // Attach the honest, depth-adjusted edge to the opportunity (mutating the
+    // stored record) so the dashboard can show what the trade was really worth
+    // next to the optimistic top-of-book quote. Broadcast below carries it.
+    opp.depthNetPct = gate.depthNetPct;
+
     if (!gate.ok) {
       logger.warn(
         {

@@ -30,6 +30,15 @@ export interface ArbitrageOpportunity {
   grossProfitPct: number;
   netProfitPct: number;
   wasPaperTraded: boolean;
+  /**
+   * The honest edge: net profit after replaying the trade against real
+   * order-book depth (VWAP) and fees — i.e. what the trade would actually be
+   * worth, versus `netProfitPct` which is priced at an optimistic top-of-book.
+   *
+   * Only set for live-mode candidates that reached the depth gate; left
+   * undefined for paper opportunities, which take no depth snapshot.
+   */
+  depthNetPct?: number | null;
 }
 
 export interface PaperTrade {
