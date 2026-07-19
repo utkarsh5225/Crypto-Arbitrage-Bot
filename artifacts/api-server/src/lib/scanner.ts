@@ -567,15 +567,19 @@ async function loadExchangeInfo(): Promise<boolean> {
         quoteAsset: s.quoteAsset,
       });
 
-      // Extract quantity precision from MARKET_LOT_SIZE (preferred for MARKET
-      // orders) falling back to LOT_SIZE.  A stepSize of "0.00000000" means the
-      // exchange imposes no step constraint — in that case we use basePrecision.
+      // Both MARKET_LOT_SIZE and LOT_SIZE constrain a market order's quantity,
+      // and BOTH must be satisfied. MARKET_LOT_SIZE.stepSize is frequently
+      // "0.00000000" (no extra market-specific step), but that does NOT lift the
+      // base LOT_SIZE step. Take the coarser (larger) non-zero step, which is a
+      // multiple of the finer one and therefore valid for both filters.
       const marketLot = s.filters.find((f) => f.filterType === "MARKET_LOT_SIZE");
       const lot = s.filters.find((f) => f.filterType === "LOT_SIZE");
-      const rawStep = marketLot?.stepSize ?? lot?.stepSize ?? "0";
-      const lotStepSize = parseFloat(rawStep);
-      const rawMinQty = marketLot?.minQty ?? lot?.minQty ?? "0";
-      const minQty = parseFloat(rawMinQty);
+      const marketStep = parseFloat(marketLot?.stepSize ?? "0") || 0;
+      const lotStep = parseFloat(lot?.stepSize ?? "0") || 0;
+      const lotStepSize = Math.max(marketStep, lotStep);
+      const marketMinQty = parseFloat(marketLot?.minQty ?? "0") || 0;
+      const lotMinQty = parseFloat(lot?.minQty ?? "0") || 0;
+      const minQty = Math.max(marketMinQty, lotMinQty);
 
       // Minimum order value in the quote asset. Newer exchange info uses the
       // NOTIONAL filter (field `minNotional`); older uses MIN_NOTIONAL.
