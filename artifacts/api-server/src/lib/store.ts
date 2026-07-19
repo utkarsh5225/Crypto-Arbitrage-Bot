@@ -12,6 +12,13 @@ export interface BotConfig {
   dailyLossUsd: number; // read-only; managed internally
   useTestnet: boolean; // route live orders/account to Binance Spot Testnet
   maxSlippagePct: number; // abort a live triangle if a leg slips past this (0 disables)
+  /**
+   * Extra edge required, on top of minProfitThreshold, at the depth-aware entry
+   * gate — a cushion for the residual drift between the depth snapshot and the
+   * actual fill. A live trade only fires if the VWAP-simulated net edge clears
+   * `minProfitThreshold + slippageBudgetPct`.
+   */
+  slippageBudgetPct: number;
 }
 
 export interface ArbitrageOpportunity {
@@ -124,6 +131,7 @@ class Store {
     dailyLossUsd: 0,
     useTestnet: false,
     maxSlippagePct: 0.005,
+    slippageBudgetPct: 0.002,
   };
 
   opportunities: ArbitrageOpportunity[] = [];

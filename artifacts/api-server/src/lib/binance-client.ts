@@ -102,6 +102,12 @@ export interface BinanceAccount {
   canTrade: boolean;
 }
 
+/** Order-book depth snapshot: [price, quantity] string tuples, best level first. */
+export interface BinanceDepth {
+  bids: [string, string][];
+  asks: [string, string][];
+}
+
 export class BinanceClient {
   private readonly baseUrl: string;
 
@@ -212,6 +218,24 @@ export class BinanceClient {
    */
   async getAccount(): Promise<BinanceAccount> {
     return this.request<BinanceAccount>("GET", "/api/v3/account");
+  }
+
+  /**
+   * Fetch an order-book depth snapshot for `symbol` (public, unsigned endpoint).
+   * Routes to the same base URL (testnet vs production) as orders, so the depth
+   * we size against is the depth we will actually trade against.
+   *
+   * `limit` must be a Binance-accepted value (5,10,20,50,100,500,1000,5000).
+   */
+  async getDepth(symbol: string, limit = 100): Promise<BinanceDepth> {
+    const url = `${this.baseUrl}/api/v3/depth?symbol=${encodeURIComponent(symbol)}&limit=${limit}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    const text = await res.text();
+    if (!res.ok) {
+      logger.error({ status: res.status, body: text, symbol }, "Binance depth error");
+      throw new Error(`Binance depth ${res.status}: ${text}`);
+    }
+    return JSON.parse(text) as BinanceDepth;
   }
 
   /**

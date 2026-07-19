@@ -3,8 +3,9 @@ import { logger } from "./logger";
 import { store, type TopOpportunity } from "./store";
 import { sseManager } from "./sse-manager";
 import { getCredentials } from "./credentials";
+import { createClient } from "./binance-client";
 import { executeLiveTrade, LiveTradeError } from "./live-execution";
-import { checkTriangleMinimums } from "./precision";
+import { checkTriangleMinimums, simulateTriangleVWAP } from "./precision";
 
 interface PriceEntry {
   bid: number;
@@ -350,138 +351,31 @@ function checkSymbol(symbol: string): void {
           continue;
         }
 
-        // Mark cooldown, take the in-flight lock, and record opportunity before
-        // async execution.
+        // Per-trade daily-loss headroom guard: don't even start a trade whose
+        // plausible worst-case loss (taker fees on all legs + entry and unwind
+        // slippage) could push past the remaining daily-loss budget. The
+        // post-trade check would otherwise only catch the breach AFTER the
+        // overshoot has already been booked.
+        if (store.config.dailyLossLimitUsd > 0) {
+          const remaining = store.config.dailyLossLimitUsd - store.config.dailyLossUsd;
+          const worstCaseLossUsd =
+            (3 * store.config.feeRate + 2 * store.config.maxSlippagePct) * tradeNotional;
+          if (worstCaseLossUsd > remaining) {
+            recentlyTraded.set(pathKey, Date.now());
+            logger.warn(
+              { path: pathKey, remaining, worstCaseLossUsd },
+              "Skipping live trade — insufficient daily-loss headroom for worst-case",
+            );
+            continue;
+          }
+        }
+
+        // Take the in-flight lock synchronously so the next WS message can't
+        // double-fire the same bankroll, then run the depth-aware entry gate and
+        // (only if it clears) the trade — all off the hot WS message handler.
         recentlyTraded.set(pathKey, Date.now());
         liveTradeInFlight = true;
-        const opp = store.addOpportunity({
-          timestamp: new Date(),
-          path: [...tri.path],
-          symbols: [...tri.symbols],
-          prices: result.prices,
-          grossProfitPct: result.grossPct,
-          netProfitPct: result.netPct,
-          wasPaperTraded: false,
-        });
-
-        // Fire live trade asynchronously — never block the WS message handler
-        executeLiveTrade(
-          tri,
-          opp.id,
-          tradeNotional,
-          creds.apiKey,
-          creds.apiSecret,
-          store.config.useTestnet,
-          result.prices,
-          store.config.maxSlippagePct,
-        )
-          .then((liveResult) => {
-            // Success — reset consecutive failure counter
-            consecutiveLiveFailures = 0;
-
-            const trade = store.addTrade({
-              opportunityId: opp.id,
-              timestamp: new Date(),
-              path: [...tri.path],
-              symbols: [...tri.symbols],
-              prices: liveResult.fillPrices,
-              notionalSize: tradeNotional,
-              grossProfitUsd: liveResult.netProfitUsd, // can't separate gross/net after fills
-              netProfitUsd: liveResult.netProfitUsd,
-              netProfitPct: liveResult.netProfitPct,
-              mode: "live",
-              orderIds: liveResult.orderIds,
-              fillPrices: liveResult.fillPrices,
-            });
-
-            store.addLiveOrders(liveResult.liveOrders);
-            opp.wasPaperTraded = true;
-
-            // Re-check loss limit after trade settles
-            if (store.checkDailyLossLimit()) {
-              logger.warn("Daily loss limit hit after trade — reverted to paper mode");
-              sseManager.broadcast("stats", store.getStats());
-            }
-
-            sseManager.broadcast("opportunity", {
-              ...opp,
-              timestamp: opp.timestamp.toISOString(),
-            });
-            sseManager.broadcast("trade", {
-              ...trade,
-              timestamp: trade.timestamp.toISOString(),
-            });
-          })
-          .catch((err) => {
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            logger.error({ err, path: tri.path.join("→") }, "Live trade failed");
-
-            // LiveTradeError carries structured detail: which leg failed, the
-            // legs that DID fill, and the outcome of the unwind attempt.
-            const isStructured = err instanceof LiveTradeError;
-            const legMatch = errorMsg.match(/Leg (\d+)/);
-            const failedLeg = isStructured
-              ? err.failedLeg
-              : legMatch
-                ? parseInt(legMatch[1], 10)
-                : 0;
-            const unwindOrder = isStructured ? err.unwindOrder : null;
-            const unwindError = isStructured ? err.unwindError : undefined;
-            const filledOrders = isStructured ? err.filledOrders : [];
-
-            // Persist the partial fills, the unwind order (if any), and a
-            // sentinel ERROR marker — newest first, so they read top-to-bottom.
-            const historyEntries: typeof filledOrders = [];
-            if (unwindOrder) historyEntries.push(unwindOrder);
-            historyEntries.push({
-              orderId: -Date.now(),
-              symbol: tri.symbols[Math.max(0, failedLeg - 1)] ?? tri.symbols[0],
-              side: tri.buys[Math.max(0, failedLeg - 1)] ? "BUY" : "SELL",
-              executedQty: 0,
-              avgPrice: 0,
-              status: "ERROR",
-              timestamp: new Date().toISOString(),
-              leg: failedLeg || 1,
-              trianglePath: tri.path.join("→"),
-            });
-            // filledOrders are chronological (leg 1..n); reverse so newest-first.
-            for (const o of [...filledOrders].reverse()) historyEntries.push(o);
-            store.addLiveOrders(historyEntries);
-
-            // Broadcast the failure event so the dashboard can alert the user
-            sseManager.broadcast("live_trade_failed", {
-              path: tri.path,
-              failedLeg,
-              error: errorMsg,
-              unwound: unwindOrder !== null,
-              unwindError,
-              timestamp: new Date().toISOString(),
-            });
-
-            // Broadcast the opportunity even on failure so user can see it was spotted
-            sseManager.broadcast("opportunity", {
-              ...opp,
-              timestamp: opp.timestamp.toISOString(),
-            });
-
-            // Auto-kill after MAX_CONSECUTIVE_FAILURES back-to-back failures
-            consecutiveLiveFailures++;
-            if (consecutiveLiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-              consecutiveLiveFailures = 0;
-              if (store.config.tradingMode === "live") {
-                store.config.tradingMode = "paper";
-                logger.warn(
-                  { failures: MAX_CONSECUTIVE_FAILURES },
-                  "Auto-kill triggered after consecutive live trade failures — reverted to paper mode",
-                );
-                sseManager.broadcast("stats", store.getStats());
-              }
-            }
-          })
-          .finally(() => {
-            // Release the lock so the next opportunity can fire.
-            liveTradeInFlight = false;
-          });
+        void fireLiveTrade(tri, tradeNotional, creds, result);
 
         continue; // Do not fall through to paper trade
       }
@@ -523,6 +417,203 @@ function checkSymbol(symbol: string): void {
       ...trade,
       timestamp: trade.timestamp.toISOString(),
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live trade firing — depth-aware entry gate + execution
+// ---------------------------------------------------------------------------
+
+/**
+ * Depth-aware entry gate. The scanner's top-of-book scan is optimistic: a real
+ * MARKET order for the full notional walks the book. So before committing, pull
+ * a live order-book snapshot for the 3 legs and replay the triangle at the
+ * volume-weighted fill for the intended size, net of taker fees. The trade only
+ * clears if that realistic edge beats `minProfitThreshold + slippageBudgetPct`.
+ *
+ * Depth is fetched from the same venue (testnet/production) the order will hit.
+ */
+async function evaluateDepthGate(
+  tri: Triangle,
+  tradeNotional: number,
+  creds: { apiKey: string; apiSecret: string },
+): Promise<{ ok: boolean; reason: string; depthNetPct: number | null }> {
+  const { feeRate, minProfitThreshold, slippageBudgetPct, useTestnet } = store.config;
+  const client = createClient(creds.apiKey, creds.apiSecret, useTestnet);
+
+  let books;
+  try {
+    books = await Promise.all(tri.symbols.map((s) => client.getDepth(s, 100)));
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `depth snapshot failed: ${err instanceof Error ? err.message : String(err)}`,
+      depthNetPct: null,
+    };
+  }
+
+  const sim = simulateTriangleVWAP(books, tri.buys, tradeNotional, feeRate);
+  if (!sim) {
+    return { ok: false, reason: "insufficient order-book depth for size", depthNetPct: null };
+  }
+
+  const required = minProfitThreshold + slippageBudgetPct;
+  if (sim.netPct < required) {
+    return {
+      ok: false,
+      reason: `depth-adjusted net ${(sim.netPct * 100).toFixed(3)}% < required ${(required * 100).toFixed(3)}%`,
+      depthNetPct: sim.netPct,
+    };
+  }
+  return { ok: true, reason: "ok", depthNetPct: sim.netPct };
+}
+
+/**
+ * Run the depth gate and, if it clears, execute the live triangle and record the
+ * outcome. Always releases the in-flight lock in `finally`. Never throws — a
+ * failure is logged/persisted and, after MAX_CONSECUTIVE_FAILURES in a row,
+ * auto-reverts to paper mode.
+ */
+async function fireLiveTrade(
+  tri: Triangle,
+  tradeNotional: number,
+  creds: { apiKey: string; apiSecret: string },
+  result: { grossPct: number; netPct: number; prices: number[] },
+): Promise<void> {
+  const opp = store.addOpportunity({
+    timestamp: new Date(),
+    path: [...tri.path],
+    symbols: [...tri.symbols],
+    prices: result.prices,
+    grossProfitPct: result.grossPct,
+    netProfitPct: result.netPct,
+    wasPaperTraded: false,
+  });
+
+  try {
+    // ── Depth-aware entry gate ──────────────────────────────────────────────
+    const gate = await evaluateDepthGate(tri, tradeNotional, creds);
+    if (!gate.ok) {
+      logger.warn(
+        {
+          path: tri.path.join("→"),
+          topOfBookNetPct: result.netPct,
+          depthNetPct: gate.depthNetPct,
+          reason: gate.reason,
+        },
+        "Skipping live trade — edge below depth-adjusted cost",
+      );
+      sseManager.broadcast("opportunity", { ...opp, timestamp: opp.timestamp.toISOString() });
+      return;
+    }
+
+    const liveResult = await executeLiveTrade(
+      tri,
+      opp.id,
+      tradeNotional,
+      creds.apiKey,
+      creds.apiSecret,
+      store.config.useTestnet,
+      result.prices,
+      store.config.maxSlippagePct,
+    );
+
+    // ── Success ─────────────────────────────────────────────────────────────
+    consecutiveLiveFailures = 0;
+
+    const trade = store.addTrade({
+      opportunityId: opp.id,
+      timestamp: new Date(),
+      path: [...tri.path],
+      symbols: [...tri.symbols],
+      prices: liveResult.fillPrices,
+      notionalSize: tradeNotional,
+      // Realised net is exact (final USDT − notional). Report gross as net plus
+      // the assumed fee drag so the dashboard's gross/net columns stay
+      // consistent with how paper trades are recorded.
+      grossProfitUsd: liveResult.netProfitUsd + 3 * store.config.feeRate * tradeNotional,
+      netProfitUsd: liveResult.netProfitUsd,
+      netProfitPct: liveResult.netProfitPct,
+      mode: "live",
+      orderIds: liveResult.orderIds,
+      fillPrices: liveResult.fillPrices,
+    });
+
+    store.addLiveOrders(liveResult.liveOrders);
+    opp.wasPaperTraded = true;
+
+    // Re-check loss limit after trade settles
+    if (store.checkDailyLossLimit()) {
+      logger.warn("Daily loss limit hit after trade — reverted to paper mode");
+      sseManager.broadcast("stats", store.getStats());
+    }
+
+    sseManager.broadcast("opportunity", { ...opp, timestamp: opp.timestamp.toISOString() });
+    sseManager.broadcast("trade", { ...trade, timestamp: trade.timestamp.toISOString() });
+  } catch (err) {
+    // ── Failure ─────────────────────────────────────────────────────────────
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.error({ err, path: tri.path.join("→") }, "Live trade failed");
+
+    // LiveTradeError carries structured detail: which leg failed, the legs that
+    // DID fill, and the outcome of the unwind attempt.
+    const structured = err instanceof LiveTradeError ? err : null;
+    const legMatch = errorMsg.match(/Leg (\d+)/);
+    const failedLeg = structured
+      ? structured.failedLeg
+      : legMatch
+        ? parseInt(legMatch[1], 10)
+        : 0;
+    const unwindOrder = structured ? structured.unwindOrder : null;
+    const unwindError = structured ? structured.unwindError : undefined;
+    const filledOrders = structured ? structured.filledOrders : [];
+
+    // Persist the partial fills, the unwind order (if any), and a sentinel ERROR
+    // marker — newest first, so they read top-to-bottom in the dashboard.
+    const historyEntries: typeof filledOrders = [];
+    if (unwindOrder) historyEntries.push(unwindOrder);
+    historyEntries.push({
+      orderId: -Date.now(),
+      symbol: tri.symbols[Math.max(0, failedLeg - 1)] ?? tri.symbols[0],
+      side: tri.buys[Math.max(0, failedLeg - 1)] ? "BUY" : "SELL",
+      executedQty: 0,
+      avgPrice: 0,
+      status: "ERROR",
+      timestamp: new Date().toISOString(),
+      leg: failedLeg || 1,
+      trianglePath: tri.path.join("→"),
+    });
+    // filledOrders are chronological (leg 1..n); reverse so newest-first.
+    for (const o of [...filledOrders].reverse()) historyEntries.push(o);
+    store.addLiveOrders(historyEntries);
+
+    sseManager.broadcast("live_trade_failed", {
+      path: tri.path,
+      failedLeg,
+      error: errorMsg,
+      unwound: unwindOrder !== null,
+      unwindError,
+      timestamp: new Date().toISOString(),
+    });
+
+    sseManager.broadcast("opportunity", { ...opp, timestamp: opp.timestamp.toISOString() });
+
+    // Auto-kill after MAX_CONSECUTIVE_FAILURES back-to-back failures
+    consecutiveLiveFailures++;
+    if (consecutiveLiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      consecutiveLiveFailures = 0;
+      if (store.config.tradingMode === "live") {
+        store.config.tradingMode = "paper";
+        logger.warn(
+          { failures: MAX_CONSECUTIVE_FAILURES },
+          "Auto-kill triggered after consecutive live trade failures — reverted to paper mode",
+        );
+        sseManager.broadcast("stats", store.getStats());
+      }
+    }
+  } finally {
+    // Release the lock so the next opportunity can fire.
+    liveTradeInFlight = false;
   }
 }
 

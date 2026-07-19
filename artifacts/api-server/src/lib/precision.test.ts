@@ -6,6 +6,10 @@ import {
   sumCommissionInAsset,
   adverseSlippage,
   checkTriangleMinimums,
+  simulateTriangleVWAP,
+  walkBuy,
+  walkSell,
+  type DepthBook,
 } from "./precision";
 
 // ---------------------------------------------------------------------------
@@ -142,4 +146,88 @@ test("checkTriangleMinimums reports the FIRST violating leg", () => {
     [{ minNotional: 2000, minQty: 0 }, { minNotional: 2000, minQty: 0 }, NO_MIN],
   );
   assert.equal(v?.leg, 1);
+});
+
+// ---------------------------------------------------------------------------
+// walkBuy / walkSell — order-book VWAP walking
+// ---------------------------------------------------------------------------
+
+test("walkBuy fills within a single deep level", () => {
+  // Spend 1000 USDT at 50000 with 100 BTC available → 0.02 BTC, no walking.
+  assert.ok(Math.abs(walkBuy([["50000", "100"]], 1000)! - 0.02) < 1e-12);
+});
+
+test("walkBuy walks multiple levels (impact) and returns less than top-of-book", () => {
+  // 0.01 BTC at 50000 (=500 USDT) then the rest at 50100.
+  const base = walkBuy([["50000", "0.01"], ["50100", "1"]], 1000)!;
+  // top-of-book would give 1000/50000 = 0.02; walking must yield strictly less.
+  assert.ok(base < 0.02);
+  assert.ok(Math.abs(base - (0.01 + 500 / 50100)) < 1e-12);
+});
+
+test("walkBuy returns null when depth is insufficient", () => {
+  // Only 50 USDT of depth available for a 1000 USDT order.
+  assert.equal(walkBuy([["50000", "0.001"]], 1000), null);
+});
+
+test("walkSell fills within a single deep level", () => {
+  // Sell 0.3333 ETH at bid 3060 with 1000 ETH bid depth.
+  assert.ok(Math.abs(walkSell([["3060", "1000"]], 1 / 3)! - 1020) < 1e-9);
+});
+
+test("walkSell returns null when depth is insufficient", () => {
+  assert.equal(walkSell([["3060", "0.1"]], 1), null);
+});
+
+// ---------------------------------------------------------------------------
+// simulateTriangleVWAP — depth-aware triangle profit
+// ---------------------------------------------------------------------------
+
+// USDT→BTC→ETH→USDT, buy/buy/sell, with deep single-level books.
+const DEEP_BOOKS: DepthBook[] = [
+  { bids: [], asks: [["50000", "100"]] }, // BTCUSDT: buy BTC with USDT
+  { bids: [], asks: [["0.06", "1000"]] }, // ETHBTC:  buy ETH with BTC
+  { bids: [["3060", "1000"]], asks: [] }, // ETHUSDT: sell ETH for USDT
+];
+
+test("simulateTriangleVWAP: zero-fee profit matches the book math", () => {
+  const sim = simulateTriangleVWAP(DEEP_BOOKS, [true, true, false], 1000, 0)!;
+  // 1000/50000=0.02 BTC → /0.06=0.3333 ETH → *3060=1020 USDT
+  assert.ok(Math.abs(sim.finalAmount - 1020) < 1e-6);
+  assert.ok(Math.abs(sim.netUsd - 20) < 1e-6);
+  assert.ok(Math.abs(sim.netPct - 0.02) < 1e-9);
+});
+
+test("simulateTriangleVWAP: taker fees reduce the edge on every leg", () => {
+  const gross = simulateTriangleVWAP(DEEP_BOOKS, [true, true, false], 1000, 0)!;
+  const net = simulateTriangleVWAP(DEEP_BOOKS, [true, true, false], 1000, 0.001)!;
+  assert.ok(net.netPct < gross.netPct);
+  // 0.999^3 compounding on a 1020 gross → ~1016.9 net
+  assert.ok(Math.abs(net.finalAmount - 1020 * 0.999 ** 3) < 1e-6);
+});
+
+test("simulateTriangleVWAP: thin books cut the edge vs deep books", () => {
+  // Same prices, but leg 1 only has 0.01 BTC at the top before a worse level.
+  const thin: DepthBook[] = [
+    { bids: [], asks: [["50000", "0.01"], ["50500", "100"]] },
+    { bids: [], asks: [["0.06", "1000"]] },
+    { bids: [["3060", "1000"]], asks: [] },
+  ];
+  const deep = simulateTriangleVWAP(DEEP_BOOKS, [true, true, false], 1000, 0.001)!;
+  const shallow = simulateTriangleVWAP(thin, [true, true, false], 1000, 0.001)!;
+  assert.ok(shallow.netPct < deep.netPct);
+});
+
+test("simulateTriangleVWAP: returns null when any leg lacks depth", () => {
+  const noDepth: DepthBook[] = [
+    { bids: [], asks: [["50000", "0.001"]] }, // only 50 USDT of depth
+    { bids: [], asks: [["0.06", "1000"]] },
+    { bids: [["3060", "1000"]], asks: [] },
+  ];
+  assert.equal(simulateTriangleVWAP(noDepth, [true, true, false], 1000, 0.001), null);
+});
+
+test("simulateTriangleVWAP: guards bad inputs", () => {
+  assert.equal(simulateTriangleVWAP(DEEP_BOOKS, [true, true, false], 0, 0.001), null);
+  assert.equal(simulateTriangleVWAP(DEEP_BOOKS.slice(0, 2), [true, true, false], 1000, 0.001), null);
 });

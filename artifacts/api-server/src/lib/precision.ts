@@ -89,6 +89,117 @@ export function adverseSlippage(buy: boolean, expected: number, actual: number):
   return frac > 0 ? frac : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Depth-aware (VWAP) triangle simulation
+//
+// The scanner's `evalTriangle` predicts profit from TOP-OF-BOOK prices only.
+// A real MARKET order walks the book, so a fixed notional fills at a
+// volume-weighted price that is worse than the top — which is exactly how
+// "profitable" quotes turn into realised losses. These helpers replay the 3
+// legs against a real order-book snapshot so the entry decision reflects the
+// price we would actually get for the intended size, net of taker fees.
+// ---------------------------------------------------------------------------
+
+/** One side of an order book: [price, quantity] string tuples, best level first. */
+export interface DepthBook {
+  /** Descending by price (best/highest first). */
+  bids: [string, string][];
+  /** Ascending by price (best/lowest first). */
+  asks: [string, string][];
+}
+
+export interface VwapSim {
+  /** Realised net return as a fraction of notional (e.g. 0.0012 = +0.12%). */
+  netPct: number;
+  /** Realised net profit in the starting (USDT) unit. */
+  netUsd: number;
+  /** Final USDT amount after all 3 legs. */
+  finalAmount: number;
+}
+
+/**
+ * Spend `quoteToSpend` walking ASKS (price ascending). Returns the base amount
+ * received, or null if the book lacks the depth to fill the whole size (we must
+ * never assume liquidity that isn't there).
+ */
+export function walkBuy(asks: [string, string][], quoteToSpend: number): number | null {
+  let remaining = quoteToSpend;
+  let base = 0;
+  for (const [pStr, qStr] of asks) {
+    const price = parseFloat(pStr);
+    const qty = parseFloat(qStr);
+    if (!(price > 0) || !(qty > 0)) continue;
+    const levelQuote = price * qty;
+    if (levelQuote >= remaining) {
+      base += remaining / price;
+      remaining = 0;
+      break;
+    }
+    base += qty;
+    remaining -= levelQuote;
+  }
+  if (remaining > 1e-9) return null; // insufficient depth
+  return base;
+}
+
+/**
+ * Sell `baseToSell` walking BIDS (price descending). Returns the quote amount
+ * received, or null if the book lacks the depth to fill the whole size.
+ */
+export function walkSell(bids: [string, string][], baseToSell: number): number | null {
+  let remaining = baseToSell;
+  let quote = 0;
+  for (const [pStr, qStr] of bids) {
+    const price = parseFloat(pStr);
+    const qty = parseFloat(qStr);
+    if (!(price > 0) || !(qty > 0)) continue;
+    if (qty >= remaining) {
+      quote += remaining * price;
+      remaining = 0;
+      break;
+    }
+    quote += qty * price;
+    remaining -= qty;
+  }
+  if (remaining > 1e-9) return null; // insufficient depth
+  return quote;
+}
+
+/**
+ * Replay a 3-leg triangle against real order-book depth, walking each book to
+ * the volume-weighted fill for `notional` and deducting `feeRate` on the asset
+ * received at every leg (matching how Binance charges taker fees and how
+ * live-execution threads net-of-commission amounts forward).
+ *
+ * Returns null if any leg lacks the depth to fill the size — the caller should
+ * then skip the trade rather than execute into a book that can't absorb it.
+ *
+ * `books[i]` is the order book for leg i's symbol; `buys[i]` is its direction
+ * (BUY spends quote→receives base; SELL sells base→receives quote). Books are
+ * Binance-ordered (bids high→low, asks low→high).
+ */
+export function simulateTriangleVWAP(
+  books: DepthBook[],
+  buys: boolean[],
+  notional: number,
+  feeRate: number,
+): VwapSim | null {
+  if (books.length < 3 || !(notional > 0)) return null;
+  let amount = notional; // starts as USDT (the quote asset of leg 1)
+  for (let i = 0; i < 3; i++) {
+    const book = books[i];
+    if (!book) return null;
+    const received = buys[i]
+      ? walkBuy(book.asks ?? [], amount)
+      : walkSell(book.bids ?? [], amount);
+    if (received === null) return null;
+    amount = received * (1 - feeRate);
+    if (!(amount > 0)) return null;
+  }
+  const netUsd = amount - notional;
+  return { netPct: netUsd / notional, netUsd, finalAmount: amount };
+}
+
 export interface LegFilterMinimums {
   minNotional: number;
   minQty: number;

@@ -24,10 +24,24 @@ router.put("/config", (req, res) => {
     dailyLossLimitUsd?: unknown;
     useTestnet?: unknown;
     maxSlippagePct?: unknown;
+    slippageBudgetPct?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
-    store.config.feeRate = body.feeRate;
+    // Guard against an unrealistically low fee that would make the profitability
+    // math (and the depth-aware entry gate) optimistic and trade at a real loss.
+    // 0.075% is the Binance spot taker floor WITH the BNB discount; anything
+    // below that is not achievable, so clamp up rather than silently accept it.
+    const MIN_REALISTIC_FEE_RATE = 0.00075;
+    if (body.feeRate < MIN_REALISTIC_FEE_RATE) {
+      logger.warn(
+        { requested: body.feeRate, clampedTo: MIN_REALISTIC_FEE_RATE },
+        "feeRate below realistic Binance taker floor — clamping up for safety",
+      );
+      store.config.feeRate = MIN_REALISTIC_FEE_RATE;
+    } else {
+      store.config.feeRate = body.feeRate;
+    }
   }
   if (
     typeof body.minProfitThreshold === "number" &&
@@ -47,6 +61,13 @@ router.put("/config", (req, res) => {
   }
   if (typeof body.maxSlippagePct === "number" && body.maxSlippagePct >= 0 && body.maxSlippagePct < 1) {
     store.config.maxSlippagePct = body.maxSlippagePct;
+  }
+  if (
+    typeof body.slippageBudgetPct === "number" &&
+    body.slippageBudgetPct >= 0 &&
+    body.slippageBudgetPct < 1
+  ) {
+    store.config.slippageBudgetPct = body.slippageBudgetPct;
   }
 
   // Testnet toggle — only allowed while paper trading, since production and
