@@ -48,6 +48,7 @@ Thumbs.db
 .cache/
 .local/
 .binance-credentials.json
+.llm-credentials.json
 .credentials-key
 
 # Persistent store data
