@@ -223,6 +223,18 @@ export default function Dashboard() {
     });
   };
 
+  // Zero the accumulated daily-loss counter (raw fetch — this endpoint is not in
+  // the generated client). Clears a stale loss that keeps reverting Live to Paper.
+  const handleResetDailyLoss = () => {
+    fetch('/api/bot/reset-daily-loss', { method: 'POST' })
+      .then((r) => r.json())
+      .then((d: { previousDailyLossUsd?: number }) => {
+        toast.success(`Daily-loss counter reset (was $${(d.previousDailyLossUsd ?? 0).toFixed(2)})`);
+        refetchConfig();
+      })
+      .catch((err) => toast.error(err?.message ?? 'Failed to reset daily-loss counter'));
+  };
+
   const opportunities = opportunitiesResponse?.data ?? [];
   const trades = tradesResponse?.data ?? [];
 
@@ -577,6 +589,14 @@ export default function Dashboard() {
                   <div className="space-y-1.5">
                     <Label htmlFor="dailyLoss" className="text-xs">Daily Loss Limit ($)</Label>
                     <Input id="dailyLoss" value={dailyLossLimit} onChange={e => setDailyLossLimit(e.target.value)} type="number" step="5" className="bg-background/50 h-8 text-xs" />
+                    <button
+                      type="button"
+                      onClick={handleResetDailyLoss}
+                      title="Zero the accumulated daily-loss counter. Use if a stale loss keeps reverting Live to Paper."
+                      className="text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground underline underline-offset-2"
+                    >
+                      Reset counter{(stats?.dailyLossUsd ?? 0) > 0 ? ` ($${(stats?.dailyLossUsd ?? 0).toFixed(2)})` : ''}
+                    </button>
                   </div>
                   <div className="space-y-1.5">
                     <Label htmlFor="maxSlippage" className="text-xs">Max Slippage (%)</Label>

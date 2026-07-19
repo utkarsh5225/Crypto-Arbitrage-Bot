@@ -349,6 +349,19 @@ class Store {
     return false;
   }
 
+  /**
+   * Manually zero the daily-loss counter. Useful when a stale accumulated loss
+   * (e.g. from earlier misconfigured runs) is holding the daily-loss guard down
+   * and immediately reverting Live mode to Paper. Does not touch the limit.
+   */
+  resetDailyLoss(): number {
+    const previous = this.config.dailyLossUsd;
+    this.config.dailyLossUsd = 0;
+    this.currentDay = new Date().toDateString();
+    this._scheduleSave();
+    return previous;
+  }
+
   /** Called by the scanner with the best candidates from the last 2s window */
   setTopScan(candidates: TopOpportunity[]): void {
     // Sort descending by netProfitPct and keep top N
