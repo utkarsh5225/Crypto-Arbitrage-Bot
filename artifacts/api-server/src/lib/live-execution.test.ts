@@ -53,6 +53,12 @@ function makeDeps(usdtFree: number, scripts: Scripted[]) {
       minNotional: 0,
       minQty: 0,
     }),
+    // Default: every asset sells directly into {ASSET}USDT.
+    getUnwindRoute: (asset: string) => ({
+      symbol: `${asset}USDT`,
+      side: "SELL" as const,
+      assetIsBase: true,
+    }),
   };
   return { deps, calls };
 }
@@ -157,6 +163,68 @@ test("executeLiveTrade: aborts and unwinds when a leg slips past the limit", asy
       assert.match(err.message, /slippage/i);
       assert.ok(err.unwindOrder, "expected an unwind order");
       assert.equal(err.unwindOrder!.symbol, "BTCUSDT");
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Inverted unwind pairs (e.g. TRY: only USDTTRY exists, not TRYUSDT)
+// ---------------------------------------------------------------------------
+
+// USDT → TRY → G → USDT
+const TRI_TRY: TriangleForExecution = {
+  path: ["USDT", "TRY", "G", "USDT"],
+  symbols: ["USDTTRY", "GTRY", "GUSDT"],
+  buys: [false, true, false],
+};
+
+test("executeLiveTrade: unwinds via the INVERTED pair (BUY USDT with the asset as quote)", async () => {
+  const { deps, calls } = makeDeps(2000, [
+    { executedQty: "1000", cummulativeQuoteQty: "34000" }, // leg1: sell USDT → 34000 TRY
+    { executedQty: "0", cummulativeQuoteQty: "0", status: "EXPIRED" }, // leg2 zero-fills → abort
+    { executedQty: "995", cummulativeQuoteQty: "34000" }, // unwind: BUY 995 USDT spending TRY
+  ]);
+
+  // TRY has no TRYUSDT pair — it must unwind by BUYING USDT on USDTTRY.
+  deps.getUnwindRoute = (asset: string) =>
+    asset === "TRY"
+      ? { symbol: "USDTTRY", side: "BUY" as const, assetIsBase: false }
+      : { symbol: `${asset}USDT`, side: "SELL" as const, assetIsBase: true };
+
+  await assert.rejects(
+    () => executeLiveTrade(TRI_TRY, "op6", 1000, "k", "s", false, [34, 0.5, 2], 0, deps),
+    (err: unknown) => {
+      assert.ok(err instanceof LiveTradeError);
+      assert.equal(err.failedLeg, 2);
+      assert.ok(err.unwindOrder, "expected an unwind order");
+      // Must have unwound on the inverted pair, as a BUY, not a SELL of TRYUSDT.
+      assert.equal(err.unwindOrder!.symbol, "USDTTRY");
+      assert.equal(err.unwindOrder!.side, "BUY");
+      return true;
+    },
+  );
+
+  // The unwind must send quoteOrderQty (spending TRY), never a base quantity.
+  const unwindCall = calls[calls.length - 1];
+  assert.equal(unwindCall.symbol, "USDTTRY");
+  assert.equal(unwindCall.side, "BUY");
+  assert.ok("quoteOrderQty" in unwindCall.qty, "inverted unwind must use quoteOrderQty");
+});
+
+test("executeLiveTrade: reports an error when no unwind route exists at all", async () => {
+  const { deps } = makeDeps(2000, [
+    { executedQty: "0.02", cummulativeQuoteQty: "1000" },
+    { executedQty: "0", cummulativeQuoteQty: "0", status: "EXPIRED" },
+  ]);
+  deps.getUnwindRoute = () => null; // neither pair direction exists
+
+  await assert.rejects(
+    () => executeLiveTrade(TRI, "op7", 1000, "k", "s", false, EXPECTED, 0, deps),
+    (err: unknown) => {
+      assert.ok(err instanceof LiveTradeError);
+      assert.equal(err.unwindOrder, null);
+      assert.match(err.unwindError ?? "", /no USDT pair/i);
       return true;
     },
   );

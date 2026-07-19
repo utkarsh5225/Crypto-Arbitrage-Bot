@@ -64,6 +64,40 @@ export function getSymbolFilters(symbol: string): SymbolFilters {
   );
 }
 
+/** How to convert an asset back to USDT in a single market order. */
+export interface UnwindRoute {
+  symbol: string;
+  side: "BUY" | "SELL";
+  /** true → asset is the BASE (sell it); false → asset is the QUOTE (spend it). */
+  assetIsBase: boolean;
+}
+
+/**
+ * Resolve the one-hop route that converts `asset` back to USDT.
+ *
+ * Most assets have a direct `{ASSET}USDT` pair where we SELL the asset (it is
+ * the base). But some — notably fiat quotes like TRY — only exist in the
+ * inverted form `USDT{ASSET}` (e.g. USDTTRY), where USDT is the base. There the
+ * unwind is a BUY of USDT, *spending* the stranded asset as the quote.
+ *
+ * Both are valid single-hop exits. Only checking the `{ASSET}USDT` form
+ * silently disqualifies every triangle routed through such an asset, which is
+ * why TRY paths were never traded.
+ *
+ * Returns null when neither pair exists — meaning there is no safe one-hop way
+ * out, so the triangle must not be traded.
+ */
+export function getUnwindRoute(asset: string): UnwindRoute | null {
+  if (asset === "USDT") return null; // nothing to convert
+  if (symbolFilters.has(`${asset}USDT`)) {
+    return { symbol: `${asset}USDT`, side: "SELL", assetIsBase: true };
+  }
+  if (symbolFilters.has(`USDT${asset}`)) {
+    return { symbol: `USDT${asset}`, side: "BUY", assetIsBase: false };
+  }
+  return null;
+}
+
 interface Triangle {
   /** Full path including return: e.g. ["USDT","BTC","ETH","USDT"] */
   path: string[];
@@ -337,12 +371,13 @@ function checkSymbol(symbol: string): void {
           continue;
         }
 
-        // Unwind-safety: only trade triangles whose intermediate assets each have
-        // a direct {asset}USDT pair, so a mid-triangle failure can always be
-        // converted back to USDT instead of stranding an unrecoverable position.
+        // Unwind-safety: only trade triangles whose intermediate assets can each
+        // be converted back to USDT in one hop, so a mid-triangle failure can
+        // always be unwound instead of stranding an unrecoverable position.
+        // Accepts BOTH {ASSET}USDT and the inverted USDT{ASSET} form.
         const midAsset = tri.path[1];
         const endAsset = tri.path[2];
-        if (!symbolFilters.has(`${midAsset}USDT`) || !symbolFilters.has(`${endAsset}USDT`)) {
+        if (!getUnwindRoute(midAsset) || !getUnwindRoute(endAsset)) {
           recentlyTraded.set(pathKey, Date.now());
           logger.warn(
             { path: pathKey, midAsset, endAsset },

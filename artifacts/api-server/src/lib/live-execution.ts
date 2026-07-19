@@ -16,7 +16,7 @@
  */
 
 import { createClient, type BinanceOrderResult, type BinanceAccount } from "./binance-client";
-import { getSymbolFilters, type SymbolFilters } from "./scanner";
+import { getSymbolFilters, getUnwindRoute, type SymbolFilters, type UnwindRoute } from "./scanner";
 import { type LiveOrder } from "./store";
 import { logger } from "./logger";
 import { roundToStep, roundQuote, sumCommissionInAsset, adverseSlippage } from "./precision";
@@ -38,11 +38,14 @@ export interface ExecClient {
 export interface ExecutionDeps {
   makeClient: (apiKey: string, apiSecret: string, useTestnet: boolean) => ExecClient;
   getFilters: (symbol: string) => SymbolFilters;
+  /** Resolves how to convert a stranded asset back to USDT (either pair direction). */
+  getUnwindRoute: (asset: string) => UnwindRoute | null;
 }
 
 const defaultDeps: ExecutionDeps = {
   makeClient: (apiKey, apiSecret, useTestnet) => createClient(apiKey, apiSecret, useTestnet),
   getFilters: getSymbolFilters,
+  getUnwindRoute,
 };
 
 /**
@@ -118,16 +121,31 @@ async function attemptUnwind(
   amount: number,
   pathLabel: string,
   failedLeg: number,
-  getFilters: ExecutionDeps["getFilters"],
+  deps: ExecutionDeps,
 ): Promise<{ order: LiveOrder | null; error?: string }> {
   if (asset === "USDT") {
     // Nothing was converted yet (leg 1 failed) — no position to unwind.
     return { order: null };
   }
 
-  const symbol = `${asset}USDT`;
-  const filters = getFilters(symbol);
-  const qty = roundToStep(amount, filters.lotStepSize, filters.basePrecision);
+  // Resolve the pair AND direction: most assets sell into {ASSET}USDT, but some
+  // (e.g. TRY) only exist as USDT{ASSET}, where we instead BUY USDT spending the
+  // stranded asset as the quote.
+  const route = deps.getUnwindRoute(asset);
+  if (!route) {
+    const error = `Unwind skipped: no USDT pair in either direction for ${asset}`;
+    logger.warn({ asset, amount }, error);
+    return { order: null, error };
+  }
+
+  const { symbol, side, assetIsBase } = route;
+  const filters = deps.getFilters(symbol);
+
+  // Selling the asset → send a base quantity (lot-step rounded).
+  // Buying USDT with the asset → send a quote amount (quote-precision rounded).
+  const qty = assetIsBase
+    ? roundToStep(amount, filters.lotStepSize, filters.basePrecision)
+    : roundQuote(amount, filters.quotePrecision);
 
   if (qty <= 0) {
     const error = `Unwind skipped: ${amount} ${asset} rounds to zero on ${symbol}`;
@@ -136,16 +154,22 @@ async function attemptUnwind(
   }
 
   logger.warn(
-    { asset, symbol, qty, path: pathLabel, failedLeg },
+    { asset, symbol, side, qty, path: pathLabel, failedLeg },
     "Attempting to unwind stranded asset back to USDT",
   );
 
   try {
-    const order = await client.placeMarketOrder(symbol, "SELL", { quantity: qty });
+    const order = await client.placeMarketOrder(
+      symbol,
+      side,
+      assetIsBase ? { quantity: qty } : { quoteOrderQty: qty },
+    );
+    // USDT recovered: selling the asset yields quote; buying USDT yields base.
+    const recoveredUsdt = assetIsBase ? order.cummulativeQuoteQty : order.executedQty;
     const liveOrder: LiveOrder = {
       orderId: order.orderId,
       symbol,
-      side: "SELL",
+      side,
       executedQty: parseFloat(order.executedQty),
       avgPrice: avgFillPrice(order),
       status: `UNWIND_${order.status}`,
@@ -154,13 +178,13 @@ async function attemptUnwind(
       trianglePath: `${pathLabel} (unwind)`,
     };
     logger.info(
-      { symbol, orderId: order.orderId, recoveredUsdt: order.cummulativeQuoteQty },
+      { symbol, side, orderId: order.orderId, recoveredUsdt },
       "Unwind complete — stranded asset converted back to USDT",
     );
     return { order: liveOrder };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
-    logger.error({ err, symbol, asset, qty }, "Unwind failed — position left open");
+    logger.error({ err, symbol, side, asset, qty }, "Unwind failed — position left open");
     return { order: null, error };
   }
 }
@@ -228,7 +252,7 @@ export async function executeLiveTrade(
         currentAmount,
         pathLabel,
         i + 1,
-        deps.getFilters,
+        deps,
       );
       throw new LiveTradeError(
         `Leg ${i + 1} (${symbol} ${side}) failed: ${reason}`,
@@ -356,7 +380,7 @@ export async function executeLiveTrade(
           currentAmount,
           pathLabel,
           i + 1,
-          deps.getFilters,
+          deps,
         );
         throw new LiveTradeError(
           `Leg ${i + 1} (${symbol} ${side}) slippage ${(slip * 100).toFixed(2)}% exceeded limit ${(maxSlippage * 100).toFixed(2)}%`,
