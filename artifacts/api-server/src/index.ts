@@ -2,6 +2,7 @@ import type { Server } from "http";
 import app from "./app";
 import { logger } from "./lib/logger";
 import { startScanner, stopTrading, isLiveTradeInFlight } from "./lib/scanner";
+import { startLlmTrader, stopLlmTrader } from "./lib/llm-trader";
 import { store } from "./lib/store";
 
 const rawPort = process.env["PORT"];
@@ -35,6 +36,10 @@ const server: Server = app.listen(port, host, (err?: Error) => {
   startScanner().catch((scannerErr) => {
     logger.error({ err: scannerErr }, "Scanner failed to start");
   });
+
+  // Start the DeepSeek decision loop. It is a no-op until llmEnabled is set and
+  // a key is configured, and it only ever paper-trades.
+  startLlmTrader();
 });
 
 // ---------------------------------------------------------------------------
@@ -53,6 +58,7 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "Shutdown signal received — draining");
 
   stopTrading();
+  stopLlmTrader();
 
   // Wait up to ~6s for an in-flight live trade to finish before flushing.
   const deadline = Date.now() + 6_000;

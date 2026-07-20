@@ -152,6 +152,32 @@ export default function Dashboard() {
       .catch(() => toast.error('Could not remove key'));
   };
 
+  // ── LLM paper-trading scoreboard ───────────────────────────────────────────
+  const [llmStats, setLlmStats] = useState<any>(null);
+  const [llmTrades, setLlmTrades] = useState<any[]>([]);
+
+  useEffect(() => {
+    const pull = () => {
+      fetch('/api/llm/stats').then(r => r.json()).then(setLlmStats).catch(() => {});
+      fetch('/api/llm/trades?limit=12').then(r => r.json())
+        .then(d => setLlmTrades(d.data ?? [])).catch(() => {});
+    };
+    pull();
+    const h = setInterval(pull, 10000);
+    return () => clearInterval(h);
+  }, []);
+
+  const llmEnabled = !!config?.llmEnabled;
+  const handleToggleLlm = () => {
+    updateConfig.mutate({ data: { llmEnabled: !llmEnabled } } as any, {
+      onSuccess: () => {
+        toast.success(!llmEnabled ? 'DeepSeek loop ENABLED (paper)' : 'DeepSeek loop stopped');
+        refetchConfig();
+      },
+      onError: (err: any) => toast.error(err?.message ?? 'Could not toggle'),
+    });
+  };
+
   // ── Live mode confirmation modal ───────────────────────────────────────────
   const [showLiveConfirm, setShowLiveConfirm] = useState(false);
 
@@ -824,12 +850,115 @@ export default function Dashboard() {
                       </Button>
                     )}
                   </div>
+                  {llmStatus.configured && (
+                    <Button
+                      onClick={handleToggleLlm}
+                      size="sm"
+                      variant={llmEnabled ? 'destructive' : 'outline'}
+                      className="h-8 text-xs font-bold"
+                    >
+                      {llmEnabled ? 'Stop DeepSeek Loop' : 'Start DeepSeek Loop (Paper)'}
+                    </Button>
+                  )}
                 </div>
               </div>
             </CardContent>
           </Card>
         </div>
       </div>
+
+      {/* ── DeepSeek paper-trading scoreboard ─────────────────────────────────── */}
+      {llmStatus.configured && (
+        <Card>
+          <CardHeader className="py-3 flex flex-row items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Activity className="h-4 w-4 text-primary" />
+              <CardTitle>DeepSeek Scalper — Paper</CardTitle>
+            </div>
+            <Badge variant="outline" className={cn('text-[10px]', llmEnabled ? 'text-green-400' : 'text-muted-foreground')}>
+              {llmEnabled ? 'RUNNING' : 'STOPPED'}
+            </Badge>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <div>
+                <p className="text-[10px] uppercase text-muted-foreground">Trades</p>
+                <p className="text-lg font-bold">{llmStats?.trades ?? 0}</p>
+                <p className="text-[10px] text-muted-foreground">{llmStats?.skips ?? 0} flat calls</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase text-muted-foreground">Win rate</p>
+                <p className="text-lg font-bold">{((llmStats?.winRate ?? 0) * 100).toFixed(1)}%</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase text-muted-foreground">Avg net / trade</p>
+                <p className={cn('text-lg font-bold', (llmStats?.avgNetBps ?? 0) > 0 ? 'text-green-400' : 'text-destructive')}>
+                  {(llmStats?.avgNetBps ?? 0).toFixed(2)}<span className="text-xs"> bps</span>
+                </p>
+                <p className="text-[10px] text-muted-foreground">cost {llmStats?.roundTripCostBps ?? 10} bps</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase text-muted-foreground">Coin-flip control</p>
+                <p className="text-lg font-bold text-muted-foreground">
+                  {(llmStats?.avgRandomNetBps ?? 0).toFixed(2)}<span className="text-xs"> bps</span>
+                </p>
+              </div>
+            </div>
+
+            {/* the number that decides it */}
+            <div className="rounded-md border border-border bg-muted/30 px-3 py-2">
+              <div className="flex items-baseline justify-between">
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Edge vs random (the only number that matters)
+                </p>
+                <p className={cn('text-xl font-bold',
+                  (llmStats?.edgeVsRandom ?? 0) > 0 ? 'text-green-400' : 'text-destructive')}>
+                  {(llmStats?.edgeVsRandom ?? 0) >= 0 ? '+' : ''}{(llmStats?.edgeVsRandom ?? 0).toFixed(2)} bps
+                </p>
+              </div>
+              <p className="text-[10px] text-muted-foreground mt-1">
+                DeepSeek's average result minus a same-instant coin flip using identical stop/target.
+                Near zero = no edge, however confident the reasoning sounds. Needs ~100+ trades to mean anything.
+              </p>
+            </div>
+
+            {llmTrades.length > 0 && (
+              <div className="overflow-auto max-h-56">
+                <Table>
+                  <TableHeader className="sticky top-0 bg-card">
+                    <TableRow className="hover:bg-transparent">
+                      <TableHead className="w-[70px]">Side</TableHead>
+                      <TableHead className="text-right">Net</TableHead>
+                      <TableHead className="text-right">Flip</TableHead>
+                      <TableHead className="w-[60px]">Exit</TableHead>
+                      <TableHead>Model reasoning</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {llmTrades.map((t) => (
+                      <TableRow key={t.id} className="text-xs border-border/40">
+                        <TableCell className={cn('font-bold', t.side === 'long' ? 'text-green-400' : 'text-destructive')}>
+                          {String(t.side).toUpperCase()}
+                        </TableCell>
+                        <TableCell className={cn('text-right font-mono', t.netBps > 0 ? 'text-green-400' : 'text-destructive')}>
+                          {t.netBps > 0 ? '+' : ''}{Number(t.netBps).toFixed(1)}
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-muted-foreground">
+                          {t.ctrlNetBps > 0 ? '+' : ''}{Number(t.ctrlNetBps).toFixed(1)}
+                        </TableCell>
+                        <TableCell className="text-muted-foreground">{t.how}</TableCell>
+                        <TableCell className="text-muted-foreground truncate max-w-[260px]" title={t.reason}>
+                          {t.reason}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* ── Top 5 Panels ─────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

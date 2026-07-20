@@ -34,6 +34,10 @@ router.put("/config", (req, res) => {
     maxSlippagePct?: unknown;
     slippageBudgetPct?: unknown;
     maxQuoteAgeMs?: unknown;
+    llmEnabled?: unknown;
+    llmSymbol?: unknown;
+    llmIntervalSec?: unknown;
+    llmMaxTradesPerDay?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -81,6 +85,24 @@ router.put("/config", (req, res) => {
   // Max age of the stalest leg's quote before a triangle is rejected (0 = off).
   if (typeof body.maxQuoteAgeMs === "number" && body.maxQuoteAgeMs >= 0) {
     store.config.maxQuoteAgeMs = body.maxQuoteAgeMs;
+  }
+  // ── LLM loop (paper only) ────────────────────────────────────────────────
+  if (typeof body.llmEnabled === "boolean") {
+    if (body.llmEnabled && !hasLlmCredentials()) {
+      res.status(400).json({ error: "Cannot enable the LLM loop: no DeepSeek API key configured" });
+      return;
+    }
+    store.config.llmEnabled = body.llmEnabled;
+    logger.info({ llmEnabled: body.llmEnabled }, "LLM loop toggled");
+  }
+  if (typeof body.llmSymbol === "string" && /^[A-Z0-9]{4,20}$/.test(body.llmSymbol)) {
+    store.config.llmSymbol = body.llmSymbol;
+  }
+  if (typeof body.llmIntervalSec === "number" && body.llmIntervalSec >= 30) {
+    store.config.llmIntervalSec = body.llmIntervalSec;
+  }
+  if (typeof body.llmMaxTradesPerDay === "number" && body.llmMaxTradesPerDay > 0) {
+    store.config.llmMaxTradesPerDay = body.llmMaxTradesPerDay;
   }
 
   // Testnet toggle — only allowed while paper trading, since production and
@@ -209,6 +231,17 @@ router.post("/config/llm", async (req, res) => {
     model: DEFAULT_MODEL,
     models: result.models,
   });
+});
+
+/** GET /api/llm/stats — scoring for the DeepSeek paper loop */
+router.get("/llm/stats", (_req, res) => {
+  res.json(store.getLlmStats());
+});
+
+/** GET /api/llm/trades — recent LLM paper trades (newest first) */
+router.get("/llm/trades", (req, res) => {
+  const limit = Math.min(200, Math.max(1, parseInt(String(req.query["limit"] ?? "50"), 10) || 50));
+  res.json({ data: store.llmTrades.slice(0, limit) });
 });
 
 /** DELETE /api/config/llm — remove the stored key */

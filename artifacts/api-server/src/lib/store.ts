@@ -30,6 +30,35 @@ export interface BotConfig {
    * be recent is what makes a quoted edge meaningful.
    */
   maxQuoteAgeMs: number;
+
+  // ── DeepSeek (LLM) scalping — PAPER ONLY ──────────────────────────────────
+  /** Master switch for the LLM decision loop. */
+  llmEnabled: boolean;
+  /** Perpetual symbol the LLM trades. */
+  llmSymbol: string;
+  /** Seconds between decisions (min 30; 60 = the 1m scalping cadence). */
+  llmIntervalSec: number;
+  /** Hard cap on simulated trades per day, so a chatty model cannot spam. */
+  llmMaxTradesPerDay: number;
+}
+
+/** One completed LLM paper trade, with its coin-flip control. */
+export interface LlmTrade {
+  id: string;
+  symbol: string;
+  side: "long" | "short";
+  entry: number;
+  exit: number;
+  grossBps: number;
+  netBps: number;
+  /** same-instant random-direction control, same stop/target, net of cost */
+  ctrlNetBps: number;
+  how: string;
+  bars: number;
+  reason: string;
+  confidence: number;
+  openedAt: number;
+  closedAt: number;
 }
 
 export interface ArbitrageOpportunity {
@@ -166,7 +195,16 @@ class Store {
     maxSlippagePct: 0.005,
     slippageBudgetPct: 0.002,
     maxQuoteAgeMs: 1000,
+    llmEnabled: false,
+    llmSymbol: "BTCUSDT",
+    llmIntervalSec: 60,
+    llmMaxTradesPerDay: 200,
   };
+
+  llmTrades: LlmTrade[] = [];
+  llmSkips = 0;
+  llmCalls = 0;
+  llmLatencyMsTotal = 0;
 
   opportunities: ArbitrageOpportunity[] = [];
   trades: PaperTrade[] = [];
@@ -391,6 +429,52 @@ class Store {
       return true; // Limit hit — caller should broadcast alert
     }
     return false;
+  }
+
+  // ── LLM paper-trading record ───────────────────────────────────────────────
+
+  addLlmTrade(t: LlmTrade): void {
+    this.llmTrades.unshift(t);
+    if (this.llmTrades.length > 500) this.llmTrades.pop();
+    this._scheduleSave();
+  }
+
+  addLlmSkip(): void {
+    this.llmSkips += 1;
+  }
+
+  bumpLlmCalls(ms: number): void {
+    this.llmCalls += 1;
+    this.llmLatencyMsTotal += ms;
+  }
+
+  /**
+   * Scoring. The headline is `edgeVsRandom`: the model's average net result
+   * minus a same-instant coin-flip taken with identical stop/target levels.
+   * If that is not clearly positive, the model has no edge — however confident
+   * or articulate its stated reasoning was.
+   */
+  getLlmStats() {
+    const t = this.llmTrades;
+    const n = t.length;
+    const dayAgo = Date.now() - 86400_000;
+    const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+    const net = mean(t.map((x) => x.netBps));
+    const ctrl = mean(t.map((x) => x.ctrlNetBps));
+    return {
+      trades: n,
+      today: t.filter((x) => x.closedAt > dayAgo).length,
+      skips: this.llmSkips,
+      calls: this.llmCalls,
+      avgLatencyMs: this.llmCalls ? Math.round(this.llmLatencyMsTotal / this.llmCalls) : 0,
+      winRate: n ? t.filter((x) => x.netBps > 0).length / n : 0,
+      avgGrossBps: mean(t.map((x) => x.grossBps)),
+      avgNetBps: net,
+      avgRandomNetBps: ctrl,
+      edgeVsRandom: net - ctrl,
+      totalNetBps: t.reduce((a, b) => a + b.netBps, 0),
+      roundTripCostBps: 10,
+    };
   }
 
   /**
