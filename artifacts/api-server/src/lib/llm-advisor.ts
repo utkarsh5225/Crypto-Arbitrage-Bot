@@ -96,6 +96,67 @@ export function buildContext(symbol: string, bars: Bar[]): string {
   ].join("\n");
 }
 
+/**
+ * Extra market context the 1-minute bars alone cannot convey: higher-timeframe
+ * trend, the real spread, perp funding, and where price sits in the day's range.
+ *
+ * Best-effort — any failed call is simply omitted. A decision must never be
+ * blocked because an enrichment endpoint was slow.
+ */
+export async function buildEnrichment(symbol: string): Promise<string> {
+  const parts: string[] = [];
+
+  const tf = async (interval: string, label: string) => {
+    const b = await fetchFuturesKlines(symbol, interval, 24);
+    const c = b.map((x) => x.c);
+    const ret = ((c[c.length - 1] / c[0] - 1) * 1e4).toFixed(1);
+    const rng = b.map((x) => ((x.h - x.l) / x.c) * 1e4);
+    const avg = (rng.reduce((a, x) => a + x, 0) / rng.length).toFixed(1);
+    const up = b.filter((x) => x.c > x.o).length;
+    parts.push(`${label}: ${ret} bps over last ${b.length} bars, avg bar range ${avg} bps, ${up}/${b.length} bars green.`);
+  };
+
+  const spread = async () => {
+    const r = await fetch(
+      `https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=${symbol}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (!r.ok) return;
+    const d = (await r.json()) as { bidPrice: string; askPrice: string };
+    const bid = parseFloat(d.bidPrice), ask = parseFloat(d.askPrice);
+    if (bid > 0 && ask > 0) {
+      parts.push(`Live spread: ${(((ask - bid) / ((ask + bid) / 2)) * 1e4).toFixed(2)} bps (you cross this on entry AND exit).`);
+    }
+  };
+
+  const funding = async () => {
+    const r = await fetch(
+      `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (!r.ok) return;
+    const d = (await r.json()) as { lastFundingRate: string; nextFundingTime: number };
+    const mins = Math.max(0, Math.round((d.nextFundingTime - Date.now()) / 60000));
+    parts.push(`Funding: ${(parseFloat(d.lastFundingRate) * 1e4).toFixed(2)} bps, next settlement in ${mins} min (longs pay shorts when positive).`);
+  };
+
+  const range = async () => {
+    const r = await fetch(
+      `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (!r.ok) return;
+    const d = (await r.json()) as { highPrice: string; lowPrice: string; lastPrice: string; priceChangePercent: string };
+    const hi = parseFloat(d.highPrice), lo = parseFloat(d.lowPrice), la = parseFloat(d.lastPrice);
+    if (hi > lo) {
+      parts.push(`24h: ${d.priceChangePercent}% change; price sits ${(((la - lo) / (hi - lo)) * 100).toFixed(0)}% of the way up the 24h range.`);
+    }
+  };
+
+  await Promise.allSettled([tf("5m", "5m trend"), tf("15m", "15m trend"), spread(), funding(), range()]);
+  return parts.length ? `\nWIDER CONTEXT\n${parts.join("\n")}` : "";
+}
+
 // ---------------------------------------------------------------------------
 // Coin selection — "which coin is best to trade right now?"
 // ---------------------------------------------------------------------------
@@ -295,8 +356,94 @@ Rules:
 - Set a stop and a target that fit the recent volatility.
 - Only return "flat" if the data is genuinely unreadable.`;
 
-export function systemPromptFor(costAware: boolean): string {
-  return costAware ? PROMPT_COST_AWARE : PROMPT_NAIVE;
+export function systemPromptFor(costAware: boolean, minRR = 2): string {
+  const rr = `\n- REWARD MUST EXCEED RISK: target_bps must be at least ${minRR}x stop_bps. A target smaller than the stop will be rejected or widened.`;
+  return (costAware ? PROMPT_COST_AWARE : PROMPT_NAIVE) + rr;
+}
+
+// ---------------------------------------------------------------------------
+// In-trade review — ask the model about a position it already has open
+// ---------------------------------------------------------------------------
+
+export interface PositionReview {
+  action: "hold" | "exit" | "tighten_stop";
+  newStopBps?: number;
+  reason: string;
+}
+
+const REVIEW_PROMPT = `You are managing an OPEN futures position you opened earlier. You will see the original trade, its current state, and fresh market data.
+
+Reply with ONLY a JSON object:
+{"action":"hold"|"exit"|"tighten_stop","new_stop_bps":<number|null>,"reason":"<max 20 words>"}
+
+Rules:
+- "hold" if the original thesis still stands.
+- "exit" to close now at market, if the thesis has broken.
+- "tighten_stop" to reduce risk, giving new_stop_bps SMALLER than the current stop distance. You may never widen a stop.
+- Closing costs 10 bps, so do not exit on noise alone.`;
+
+/**
+ * Ask the model what to do with a position it already holds.
+ * Returns null on any failure — an unusable response must leave the position
+ * untouched rather than trigger a guessed action.
+ */
+export async function reviewPosition(
+  apiKey: string,
+  model: string,
+  context: string,
+  position: {
+    symbol: string; side: string; entry: number; lastPrice: number;
+    unrealBps: number; barsHeld: number; stopBps: number; targetBps: number;
+    originalReason: string;
+  },
+): Promise<{ review: PositionReview | null; error?: string; ms: number }> {
+  const started = Date.now();
+  const state = [
+    `OPEN POSITION`,
+    `Symbol: ${position.symbol}  Side: ${position.side}`,
+    `Held for: ${position.barsHeld} minutes`,
+    `Unrealised: ${position.unrealBps.toFixed(1)} bps (before the 10 bps round-trip cost)`,
+    `Stop is ${position.stopBps.toFixed(0)} bps away, target ${position.targetBps.toFixed(0)} bps away.`,
+    `Your original reason: "${position.originalReason}"`,
+  ].join("\n");
+
+  try {
+    const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: REVIEW_PROMPT },
+          { role: "user", content: `${state}\n\nCURRENT MARKET\n${context}` },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.2,
+        max_tokens: 200,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const ms = Date.now() - started;
+    if (!res.ok) return { review: null, error: `DeepSeek HTTP ${res.status}`, ms };
+
+    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    const parsed = JSON.parse(json.choices?.[0]?.message?.content ?? "{}") as Record<string, unknown>;
+    const action = String(parsed["action"] ?? "").toLowerCase();
+    if (!["hold", "exit", "tighten_stop"].includes(action)) {
+      return { review: null, error: `bad action: ${action}`, ms };
+    }
+    const ns = Number(parsed["new_stop_bps"]);
+    return {
+      review: {
+        action: action as PositionReview["action"],
+        newStopBps: ns > 0 ? ns : undefined,
+        reason: String(parsed["reason"] ?? "").slice(0, 200),
+      },
+      ms,
+    };
+  } catch (err) {
+    return { review: null, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started };
+  }
 }
 
 const SYSTEM_PROMPT = PROMPT_COST_AWARE;
@@ -310,6 +457,7 @@ export async function getDecision(
   model: string,
   context: string,
   costAware = true,
+  minRR = 2,
 ): Promise<{ decision: LlmDecision | null; raw?: string; error?: string; ms: number }> {
   const started = Date.now();
   try {
@@ -322,7 +470,7 @@ export async function getDecision(
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: systemPromptFor(costAware) },
+          { role: "system", content: systemPromptFor(costAware, minRR) },
           { role: "user", content: context },
         ],
         response_format: { type: "json_object" },

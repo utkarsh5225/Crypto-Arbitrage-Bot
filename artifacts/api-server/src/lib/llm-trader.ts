@@ -18,7 +18,14 @@ import { logger } from "./logger";
 import { store } from "./store";
 import { sseManager } from "./sse-manager";
 import { getLlmCredentials } from "./llm-credentials";
-import { fetchFuturesKlines, buildContext, getDecision, type Bar } from "./llm-advisor";
+import {
+  fetchFuturesKlines,
+  buildContext,
+  buildEnrichment,
+  getDecision,
+  reviewPosition,
+  type Bar,
+} from "./llm-advisor";
 
 /** USD-M futures taker, both sides. Same figure used across the analysis tools. */
 const ROUND_TRIP_BPS = 10;
@@ -47,9 +54,14 @@ export interface OpenPosition {
   /** Latest mark price + unrealised move, refreshed each tick for the UI. */
   lastPrice?: number;
   unrealBps?: number;
-  /** Distances the model asked for, kept so the UI can show them directly. */
+  /** Distances actually traded, kept so the UI can show them directly. */
   stopBps: number;
   targetBps: number;
+  /** What the model originally asked for, before R:R enforcement. */
+  requestedTargetBps?: number;
+  /** Latest in-trade review from the model. */
+  lastReview?: string;
+  lastReviewAt?: number;
 }
 
 const open: OpenPosition[] = [];
@@ -128,6 +140,10 @@ function updateOpen(bars: Bar[], symbol: string): void {
       confidence: p.confidence,
       openedAt: p.openedAt,
       closedAt: Date.now(),
+      requestedTargetBps: p.requestedTargetBps,
+      enforcedTargetBps: p.targetBps,
+      stopBps: p.stopBps,
+      lastReview: p.lastReview,
     });
     logger.info(
       { symbol: p.symbol, side: p.side, how, grossBps: grossBps.toFixed(1), netBps: netBps.toFixed(1) },
@@ -136,6 +152,31 @@ function updateOpen(bars: Bar[], symbol: string): void {
     open.splice(i, 1);
     sseManager.broadcast("llm_stats", store.getLlmStats());
   }
+}
+
+/** Close a position immediately at `px` and record it (used by the model's own exit). */
+function closeNow(p: OpenPosition, px: number, how: string): void {
+  const grossBps = ((p.side === "long" ? px - p.entry : p.entry - px) / p.entry) * 1e4;
+  if (p.ctrlOpen) {
+    // Mark the control to the same instant so the comparison stays fair.
+    const cg = ((p.ctrlSide === "long" ? px - p.entry : p.entry - px) / p.entry) * 1e4;
+    p.ctrlResultBps = cg - ROUND_TRIP_BPS;
+    p.ctrlOpen = false;
+  }
+  store.addLlmTrade({
+    id: p.id, symbol: p.symbol, side: p.side, entry: p.entry, exit: px,
+    grossBps, netBps: grossBps - ROUND_TRIP_BPS,
+    ctrlNetBps: p.ctrlResultBps ?? 0,
+    how, bars: p.bars, reason: p.reason, confidence: p.confidence,
+    openedAt: p.openedAt, closedAt: Date.now(),
+    requestedTargetBps: p.requestedTargetBps,
+    enforcedTargetBps: p.targetBps,
+    stopBps: p.stopBps,
+    lastReview: p.lastReview,
+  });
+  const i = open.indexOf(p);
+  if (i >= 0) open.splice(i, 1);
+  sseManager.broadcast("llm_stats", store.getLlmStats());
 }
 
 /** Symbols the operator selected from DeepSeek's picks (falls back to the single field). */
@@ -149,15 +190,57 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
   const bars = await fetchFuturesKlines(symbol, "1m", 60);
   updateOpen(bars, symbol);
 
-  // one position per symbol — an LLM will happily open ten
-  if (open.some((p) => p.symbol === symbol)) return;
+  const enrichment = await buildEnrichment(symbol).catch(() => "");
+  const ctx = buildContext(symbol, bars) + enrichment;
+
+  // ── Manage an already-open position rather than ignoring it ────────────────
+  const held = open.find((p) => p.symbol === symbol);
+  if (held) {
+    const { review, error: rErr, ms: rMs } = await reviewPosition(
+      creds.apiKey, creds.model, ctx,
+      {
+        symbol: held.symbol, side: held.side, entry: held.entry,
+        lastPrice: held.lastPrice ?? held.entry, unrealBps: held.unrealBps ?? 0,
+        barsHeld: held.bars, stopBps: held.stopBps, targetBps: held.targetBps,
+        originalReason: held.reason,
+      },
+    );
+    store.bumpLlmCalls(rMs);
+    if (!review) {
+      logger.warn({ symbol, error: rErr }, "Position review unusable — holding");
+      return;
+    }
+    store.bumpLlmReviews();
+    held.lastReview = `${review.action}: ${review.reason}`;
+    held.lastReviewAt = Date.now();
+
+    if (review.action === "exit") {
+      closeNow(held, held.lastPrice ?? held.entry, "llm_exit");
+      logger.info({ symbol, reason: review.reason }, "DeepSeek closed its own position");
+    } else if (review.action === "tighten_stop" && review.newStopBps) {
+      // Only ever reduce risk. Widening a stop turns a small loss into a large
+      // one — exactly the failure mode the R:R enforcement exists to prevent.
+      if (review.newStopBps < held.stopBps) {
+        const d = (review.newStopBps / 1e4) * held.entry;
+        held.stop = held.side === "long" ? held.entry - d : held.entry + d;
+        held.stopBps = review.newStopBps;
+        logger.info({ symbol, newStopBps: review.newStopBps, reason: review.reason }, "DeepSeek tightened its stop");
+      } else {
+        logger.warn(
+          { symbol, requested: review.newStopBps, current: held.stopBps },
+          "Ignored stop change — model tried to WIDEN the stop",
+        );
+      }
+    }
+    sseManager.broadcast("llm_stats", store.getLlmStats());
+    return;
+  }
 
   // hard cap so a chatty model cannot rack up unlimited (simulated) cost
   if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return;
 
-  const ctx = buildContext(symbol, bars);
   const { decision, error, ms } = await getDecision(
-    creds.apiKey, creds.model, ctx, cfg.llmCostAware,
+    creds.apiKey, creds.model, ctx, cfg.llmCostAware, cfg.llmMinRiskReward,
   );
 
   store.bumpLlmCalls(ms);
@@ -175,8 +258,40 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
   {
     const last = bars[bars.length - 1];
     const entry = last.c;
+
+    // ── Enforce reward > risk ────────────────────────────────────────────────
+    // Measured over its first 34 decisions the model proposed reward < risk 27
+    // times (avg R:R 0.76, most often 0.50). That produced many small wins and
+    // occasional losses ~3x larger — a 78% win rate that barely broke even.
+    // Stating it in the prompt is not enough, so it is enforced here.
+    const minRR = cfg.llmMinRiskReward;
+    const requestedTargetBps = decision.targetBps;
+    let targetBps = decision.targetBps;
+    const requiredTarget = decision.stopBps * minRR;
+
+    if (targetBps < requiredTarget) {
+      if (cfg.llmRejectLowRR) {
+        store.bumpRrRejected();
+        logger.warn(
+          { symbol, stopBps: decision.stopBps, requestedTargetBps,
+            requiredTarget, rr: +(targetBps / decision.stopBps).toFixed(2) },
+          "Rejected trade — reward below the minimum risk:reward",
+        );
+        return;
+      }
+      targetBps = requiredTarget;
+      store.bumpRrAdjusted();
+      logger.info(
+        { symbol, stopBps: decision.stopBps, requestedTargetBps,
+          enforcedTargetBps: targetBps,
+          requestedRR: +(requestedTargetBps / decision.stopBps).toFixed(2),
+          enforcedRR: minRR },
+        "Widened target to meet the minimum risk:reward",
+      );
+    }
+
     const stopD = (decision.stopBps / 1e4) * entry;
-    const tgtD = (decision.targetBps / 1e4) * entry;
+    const tgtD = (targetBps / 1e4) * entry;
     const side = decision.action;
     const ctrlSide: "long" | "short" = Math.random() < 0.5 ? "long" : "short";
 
@@ -198,11 +313,13 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
       lastPrice: entry,
       unrealBps: 0,
       stopBps: decision.stopBps,
-      targetBps: decision.targetBps,
+      targetBps,
+      requestedTargetBps,
     });
 
     logger.info(
-      { symbol, side, stopBps: decision.stopBps, targetBps: decision.targetBps,
+      { symbol, side, stopBps: decision.stopBps, targetBps,
+        rr: +(targetBps / decision.stopBps).toFixed(2),
         confidence: decision.confidence, reason: decision.reason },
       "DeepSeek paper position opened",
     );

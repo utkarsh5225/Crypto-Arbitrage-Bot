@@ -49,6 +49,21 @@ export interface BotConfig {
    *         what lets the coin-flip scoreboard actually measure it
    */
   llmCostAware: boolean;
+  /**
+   * Minimum reward:risk the model is allowed to trade.
+   *
+   * Measured over its first 34 decisions the model chose reward < risk 27 times
+   * (avg R:R 0.76, most often 0.50), producing many small wins and occasional
+   * losses ~3x larger. The prompt alone is not enough — this is enforced in
+   * code before a position opens.
+   */
+  llmMinRiskReward: number;
+  /**
+   * On a sub-minimum R:R: false = widen the target to meet the minimum
+   * (keeps the model's direction, default), true = reject the decision entirely
+   * (cleaner read of its unmodified judgement, but discards most trades).
+   */
+  llmRejectLowRR: boolean;
 }
 
 /** One completed LLM paper trade, with its coin-flip control. */
@@ -68,6 +83,12 @@ export interface LlmTrade {
   confidence: number;
   openedAt: number;
   closedAt: number;
+  /** What the model asked for vs what was actually traded after R:R enforcement. */
+  requestedTargetBps?: number;
+  enforcedTargetBps?: number;
+  stopBps?: number;
+  /** Latest in-trade review the model gave, if any. */
+  lastReview?: string;
 }
 
 export interface ArbitrageOpportunity {
@@ -210,6 +231,8 @@ class Store {
     llmIntervalSec: 60,
     llmMaxTradesPerDay: 200,
     llmCostAware: false,
+    llmMinRiskReward: 2.0,
+    llmRejectLowRR: false,
   };
 
   /** Latest coin picks returned by DeepSeek, awaiting operator selection. */
@@ -222,6 +245,10 @@ class Store {
   llmSkips = 0;
   llmCalls = 0;
   llmLatencyMsTotal = 0;
+  /** How often the model proposed reward < risk and had to be corrected. */
+  llmRrAdjusted = 0;
+  llmRrRejected = 0;
+  llmReviews = 0;
 
   opportunities: ArbitrageOpportunity[] = [];
   trades: PaperTrade[] = [];
@@ -460,6 +487,10 @@ class Store {
     this.llmSkips += 1;
   }
 
+  bumpRrAdjusted(): void { this.llmRrAdjusted += 1; }
+  bumpRrRejected(): void { this.llmRrRejected += 1; }
+  bumpLlmReviews(): void { this.llmReviews += 1; }
+
   bumpLlmCalls(ms: number): void {
     this.llmCalls += 1;
     this.llmLatencyMsTotal += ms;
@@ -491,6 +522,10 @@ class Store {
       edgeVsRandom: net - ctrl,
       totalNetBps: t.reduce((a, b) => a + b.netBps, 0),
       roundTripCostBps: 10,
+      rrAdjusted: this.llmRrAdjusted,
+      rrRejected: this.llmRrRejected,
+      reviews: this.llmReviews,
+      minRiskReward: this.config.llmMinRiskReward,
     };
   }
 

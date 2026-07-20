@@ -42,6 +42,8 @@ router.put("/config", (req, res) => {
     llmIntervalSec?: unknown;
     llmMaxTradesPerDay?: unknown;
     llmCostAware?: unknown;
+    llmMinRiskReward?: unknown;
+    llmRejectLowRR?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -107,6 +109,13 @@ router.put("/config", (req, res) => {
   }
   if (typeof body.llmMaxTradesPerDay === "number" && body.llmMaxTradesPerDay > 0) {
     store.config.llmMaxTradesPerDay = body.llmMaxTradesPerDay;
+  }
+  if (typeof body.llmMinRiskReward === "number" && body.llmMinRiskReward >= 0.5 && body.llmMinRiskReward <= 10) {
+    store.config.llmMinRiskReward = body.llmMinRiskReward;
+    logger.info({ minRR: body.llmMinRiskReward }, "LLM min risk:reward changed");
+  }
+  if (typeof body.llmRejectLowRR === "boolean") {
+    store.config.llmRejectLowRR = body.llmRejectLowRR;
   }
   if (typeof body.llmCostAware === "boolean") {
     store.config.llmCostAware = body.llmCostAware;
@@ -369,6 +378,10 @@ router.get("/llm/open", (_req, res) => {
     openedAt: p.openedAt,
     reason: p.reason,
     confidence: p.confidence,
+    riskReward: p.stopBps > 0 ? +(p.targetBps / p.stopBps).toFixed(2) : null,
+    requestedTargetBps: p.requestedTargetBps,
+    lastReview: p.lastReview,
+    lastReviewAt: p.lastReviewAt,
   }));
   res.json({ open: rows });
 });
