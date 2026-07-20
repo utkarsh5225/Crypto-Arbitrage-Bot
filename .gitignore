@@ -53,3 +53,7 @@ Thumbs.db
 
 # Persistent store data
 artifacts/api-server/data/
+
+# Python bytecode from running the analysis tools
+__pycache__/
+*.pyc
