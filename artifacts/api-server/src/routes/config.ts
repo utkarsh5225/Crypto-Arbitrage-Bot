@@ -46,6 +46,9 @@ router.put("/config", (req, res) => {
     llmRejectLowRR?: unknown;
     llmMinStopVolMult?: unknown;
     llmDecisionModel?: unknown;
+    llmAutoPick?: unknown;
+    llmMaxConcurrent?: unknown;
+    llmRepickMinutes?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -119,6 +122,33 @@ router.put("/config", (req, res) => {
   if (typeof body.llmDecisionModel === "string" && /^[a-z0-9.\-]{3,40}$/.test(body.llmDecisionModel)) {
     store.config.llmDecisionModel = body.llmDecisionModel;
     logger.info({ model: body.llmDecisionModel }, "LLM decision model changed");
+  }
+  if (typeof body.llmAutoPick === "boolean") {
+    store.config.llmAutoPick = body.llmAutoPick;
+    if (body.llmAutoPick) {
+      // Force a fresh pool on the next tick rather than trading a stale
+      // manual selection under an "auto" label.
+      store.llmPicksAt = 0;
+    }
+    logger.info({ llmAutoPick: body.llmAutoPick }, "LLM symbol selection mode changed");
+  }
+  if (
+    typeof body.llmMaxConcurrent === "number" &&
+    Number.isInteger(body.llmMaxConcurrent) &&
+    body.llmMaxConcurrent >= 1 &&
+    body.llmMaxConcurrent <= 10
+  ) {
+    store.config.llmMaxConcurrent = body.llmMaxConcurrent;
+    // The pool is sized off this, so make the next tick rebuild it.
+    store.llmPicksAt = 0;
+    logger.info({ maxConcurrent: body.llmMaxConcurrent }, "LLM concurrency changed");
+  }
+  if (
+    typeof body.llmRepickMinutes === "number" &&
+    body.llmRepickMinutes >= 1 &&
+    body.llmRepickMinutes <= 240
+  ) {
+    store.config.llmRepickMinutes = body.llmRepickMinutes;
   }
   if (typeof body.llmMinStopVolMult === "number" && body.llmMinStopVolMult >= 0 && body.llmMinStopVolMult <= 20) {
     store.config.llmMinStopVolMult = body.llmMinStopVolMult;

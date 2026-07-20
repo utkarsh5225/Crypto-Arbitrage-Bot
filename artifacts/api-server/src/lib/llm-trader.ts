@@ -1,9 +1,15 @@
 /**
  * DeepSeek scalping loop.
  *
- * Every `llmIntervalSec` it: pulls recent 1m futures bars -> asks DeepSeek for a
- * decision -> opens a simulated position -> tracks it to stop/target/timeout ->
- * records the outcome with realistic futures costs.
+ * Every `llmIntervalSec` it: maintains its own pool of candidate symbols ->
+ * manages whatever is already open -> fills any free position slots by pulling
+ * recent 1m futures bars and asking DeepSeek for a decision -> tracks each
+ * position to stop/target/timeout -> records the outcome with realistic
+ * futures costs.
+ *
+ * The operator sets HOW MANY symbols may be held at once (`llmMaxConcurrent`);
+ * the bot decides WHICH. Manual selection was removed as the default because a
+ * pick goes stale as soon as the market moves, and a stale pick is not a pick.
  *
  * PAPER ONLY. This module never places an exchange order. Live futures
  * execution is intentionally not implemented until the recorded decisions show
@@ -24,6 +30,7 @@ import {
   buildEnrichment,
   getDecision,
   reviewPosition,
+  suggestCoins,
   type Bar,
 } from "./llm-advisor";
 
@@ -239,13 +246,89 @@ function closeNow(p: OpenPosition, px: number, how: string): void {
   sseManager.broadcast("llm_stats", store.getLlmStats());
 }
 
-/** Symbols the operator selected from DeepSeek's picks (falls back to the single field). */
-function activeSymbols(): string[] {
+/** Symbols currently holding a position (deduped — one symbol can only be held once). */
+function heldSymbols(): string[] {
+  return [...new Set(open.map((p) => p.symbol))];
+}
+
+/**
+ * The symbols the bot may consider this tick.
+ *
+ * Auto mode uses the pool it picked for itself; manual mode uses the operator's
+ * selection, with the legacy single-symbol field as the last fallback.
+ */
+function candidatePool(): string[] {
+  if (store.config.llmAutoPick && store.llmPicks.length > 0) {
+    return store.llmPicks.map((p) => p.symbol);
+  }
   const sel = store.config.llmSymbols;
   return sel && sel.length > 0 ? sel : [store.config.llmSymbol];
 }
 
-async function tickSymbol(symbol: string, creds: { apiKey: string; model: string }): Promise<void> {
+let repickInFlight = false;
+
+/**
+ * Refresh the candidate pool when it is empty or stale.
+ *
+ * The pool is deliberately LARGER than the number of slots (3x, clamped 5..12)
+ * so the bot has something to choose between rather than being forced into
+ * whatever it named first. Symbols with an open position are always retained —
+ * dropping one from the pool would orphan a live position from its analysis.
+ */
+async function ensureCandidates(creds: { apiKey: string; model: string }): Promise<void> {
+  const cfg = store.config;
+  if (!cfg.llmAutoPick) return;
+
+  const ageMin = (Date.now() - store.llmPicksAt) / 60_000;
+  if (store.llmPicks.length > 0 && ageMin < cfg.llmRepickMinutes) return;
+  if (repickInFlight) return;
+
+  repickInFlight = true;
+  try {
+    const want = Math.min(12, Math.max(5, cfg.llmMaxConcurrent * 3));
+    const { picks, error, ms } = await suggestCoins(creds.apiKey, creds.model, want);
+    store.bumpLlmCalls(ms);
+
+    if (picks.length === 0) {
+      // Keep trading the previous pool rather than going dark on a bad response.
+      logger.warn({ error }, "Auto-pick returned no candidates — keeping the previous pool");
+      return;
+    }
+
+    const merged = [...picks];
+    for (const h of heldSymbols()) {
+      if (!merged.some((p) => p.symbol === h)) {
+        merged.push({ symbol: h, reason: "retained — position open", confidence: 0 });
+      }
+    }
+
+    store.llmPicks = merged;
+    store.llmPicksAt = Date.now();
+    store.config.llmSymbols = merged.map((p) => p.symbol);
+    logger.info(
+      { symbols: merged.map((p) => p.symbol).join(","), ms },
+      "Auto-picked candidate pool",
+    );
+    sseManager.broadcast("llm_picks", { picks: merged, at: store.llmPicksAt });
+  } finally {
+    repickInFlight = false;
+  }
+}
+
+type TickResult = "opened" | "none";
+
+/**
+ * One symbol, one tick.
+ *
+ * `allowEntry` is the slot gate: when false this only manages an existing
+ * position and will never open a new one. Checked BEFORE the decision call so a
+ * full book costs no API tokens.
+ */
+async function tickSymbol(
+  symbol: string,
+  creds: { apiKey: string; model: string },
+  allowEntry: boolean,
+): Promise<TickResult> {
   const cfg = store.config;
   const bars = await fetchFuturesKlines(symbol, "1m", 60);
   updateOpen(bars, symbol);
@@ -268,7 +351,7 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
     store.bumpLlmCalls(rMs);
     if (!review) {
       logger.warn({ symbol, error: rErr }, "Position review unusable — holding");
-      return;
+      return "none";
     }
     store.bumpLlmReviews();
     held.lastReview = `${review.action}: ${review.reason}`;
@@ -293,11 +376,14 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
       }
     }
     sseManager.broadcast("llm_stats", store.getLlmStats());
-    return;
+    return "none";
   }
 
+  // No free slot — do not spend a decision call we could not act on.
+  if (!allowEntry) return "none";
+
   // hard cap so a chatty model cannot rack up unlimited (simulated) cost
-  if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return;
+  if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return "none";
 
   const { decision, error, ms } = await getDecision(
     creds.apiKey, cfg.llmDecisionModel || creds.model, ctx,
@@ -307,13 +393,13 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
   store.bumpLlmCalls(ms);
   if (!decision) {
     logger.warn({ symbol, error, ms }, "DeepSeek decision unusable — skipping");
-    return;
+    return "none";
   }
   if (decision.action === "flat") {
     store.addLlmSkip();
     logger.info({ symbol, reason: decision.reason }, "DeepSeek: flat");
     sseManager.broadcast("llm_stats", store.getLlmStats());
-    return;
+    return "none";
   }
 
   {
@@ -356,7 +442,7 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
             requiredTarget, rr: +(targetBps / stopBps).toFixed(2) },
           "Rejected trade — reward below the minimum risk:reward",
         );
-        return;
+        return "none";
       }
       targetBps = requiredTarget;
       store.bumpRrAdjusted();
@@ -402,6 +488,7 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
       "DeepSeek paper position opened",
     );
     sseManager.broadcast("llm_stats", store.getLlmStats());
+    return "opened";
   }
 }
 
@@ -413,18 +500,46 @@ async function tick(): Promise<void> {
 
   inFlight = true;
   try {
-    // Sequential, not parallel: keeps API usage predictable and avoids racing
-    // several decisions against the same per-day cap.
-    for (const symbol of activeSymbols()) {
+    const cfg = store.config;
+    await ensureCandidates(creds).catch((err) => {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, "Auto-pick failed");
+    });
+
+    const run = async (symbol: string, allowEntry: boolean): Promise<TickResult> => {
       try {
-        await tickSymbol(symbol, creds);
+        return await tickSymbol(symbol, creds, allowEntry);
       } catch (err) {
         logger.warn(
           { symbol, err: err instanceof Error ? err.message : String(err) },
           "LLM tick failed for symbol",
         );
+        return "none";
       }
+    };
+
+    // ── 1. Manage what is already open ───────────────────────────────────────
+    // Unconditional and first: an open position needs its stop/target resolved
+    // and its review run whether or not there is room for anything new.
+    for (const symbol of heldSymbols()) await run(symbol, false);
+
+    // ── 2. Fill free slots ───────────────────────────────────────────────────
+    const free0 = Math.max(0, cfg.llmMaxConcurrent - open.length);
+    if (free0 === 0) return;
+
+    const pool = candidatePool().filter((s) => !open.some((p) => p.symbol === s));
+    if (pool.length === 0) return;
+
+    // Bounded scan: at most 2 look-ups per free slot, from a rotating cursor.
+    // Without the bound a 12-symbol pool would cost 12 decision calls every
+    // minute; the cursor makes sure the ones not reached this tick are the
+    // ones reached first next tick, so no candidate is starved.
+    const budget = Math.min(pool.length, free0 * 2);
+    let free = free0;
+    for (let i = 0; i < budget && free > 0; i++) {
+      const symbol = pool[(store.llmScanCursor + i) % pool.length];
+      if (await run(symbol, true) === "opened") free -= 1;
     }
+    store.llmScanCursor = (store.llmScanCursor + budget) % pool.length;
   } finally {
     inFlight = false;
   }

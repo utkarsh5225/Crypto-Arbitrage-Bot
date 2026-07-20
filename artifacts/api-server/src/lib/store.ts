@@ -36,8 +36,31 @@ export interface BotConfig {
   llmEnabled: boolean;
   /** Perpetual symbol the LLM trades (legacy single-symbol field). */
   llmSymbol: string;
-  /** Symbols selected from DeepSeek's picks. Empty = fall back to llmSymbol. */
+  /**
+   * The symbols currently in play.
+   *
+   * In auto-pick mode this is the candidate POOL the bot maintains itself, not
+   * an operator selection. In manual mode it is whatever was selected.
+   */
   llmSymbols: string[];
+  /**
+   * Let the bot choose its own symbols instead of the operator selecting them.
+   *
+   * A manual selection goes stale the moment the market moves; by the time a
+   * pick is acted on it may describe conditions that no longer exist. In auto
+   * mode the pool is refreshed on a timer and positions are opened from it.
+   */
+  llmAutoPick: boolean;
+  /**
+   * How many symbols may be held at the SAME TIME. This is the operator's
+   * real risk dial: concurrency, not symbol identity.
+   *
+   * Note this bounds positions, not the candidate pool — the bot watches more
+   * symbols than it can hold so it has something to choose between.
+   */
+  llmMaxConcurrent: number;
+  /** Minutes before the candidate pool is refreshed. Held symbols are kept. */
+  llmRepickMinutes: number;
   /** Seconds between decisions (min 30; 60 = the 1m scalping cadence). */
   llmIntervalSec: number;
   /** Hard cap on simulated trades per day, so a chatty model cannot spam. */
@@ -249,6 +272,9 @@ class Store {
     llmEnabled: false,
     llmSymbol: "BTCUSDT",
     llmSymbols: [],
+    llmAutoPick: true,
+    llmMaxConcurrent: 2,
+    llmRepickMinutes: 15,
     llmIntervalSec: 60,
     llmMaxTradesPerDay: 200,
     llmCostAware: false,
@@ -258,9 +284,16 @@ class Store {
     llmMinStopVolMult: 2.0,
   };
 
-  /** Latest coin picks returned by DeepSeek, awaiting operator selection. */
+  /**
+   * The candidate pool: symbols DeepSeek judged tradeable, with its reasoning.
+   *
+   * In manual mode these await operator selection. In auto-pick mode the trader
+   * maintains this itself and opens positions from it.
+   */
   llmPicks: { symbol: string; reason: string; confidence: number }[] = [];
   llmPicksAt = 0;
+  /** Round-robin cursor so every candidate gets evaluated over successive ticks. */
+  llmScanCursor = 0;
   /** Per-trade discussion threads, keyed by trade id. */
   llmDiscussions: Record<string, { role: "user" | "assistant"; content: string; at: number }[]> = {};
 

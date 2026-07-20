@@ -299,9 +299,9 @@ const PICK_PROMPT = `You are helping choose which perpetual futures to scalp on 
 You will see the most liquid USD-M perps with 24h stats.
 
 Reply with ONLY JSON:
-{"picks":[{"symbol":"<SYMBOL>","reason":"<max 15 words>","confidence":<0-1>}, ... exactly 5 ...]}
+{"picks":[{"symbol":"<SYMBOL>","reason":"<max 15 words>","confidence":<0-1>}, ... exactly COUNT ...]}
 
-Choose the 5 you judge most tradeable right now. Only pick symbols from the list.
+Choose the COUNT you judge most tradeable right now. Only pick symbols from the list.
 Round-trip trading cost is 10 bps, so favour symbols whose typical movement can
 clear that.
 
@@ -315,6 +315,7 @@ movers. Be honest in the confidence field — low is fine.`;
 export async function suggestCoins(
   apiKey: string,
   model: string,
+  count = 5,
 ): Promise<{ picks: CoinPick[]; error?: string; ms: number }> {
   const started = Date.now();
   let survey: { text: string; symbols: string[] };
@@ -331,12 +332,12 @@ export async function suggestCoins(
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: PICK_PROMPT },
+          { role: "system", content: PICK_PROMPT.replaceAll("COUNT", String(count)) },
           { role: "user", content: survey.text },
         ],
         response_format: { type: "json_object" },
         temperature: 0.3,
-        max_tokens: 500,
+        max_tokens: 900,
       }),
       signal: AbortSignal.timeout(45_000),
     });
@@ -358,7 +359,7 @@ export async function suggestCoins(
       }))
       // never let the model invent a symbol that is not actually tradeable
       .filter((p) => allowed.has(p.symbol))
-      .slice(0, 5);
+      .slice(0, count);
 
     return { picks, ms };
   } catch (err) {

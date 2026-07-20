@@ -203,49 +203,52 @@ export default function Dashboard() {
     });
   };
 
-  // ── Coin picks: ask DeepSeek which coins to trade, then choose ─────────────
+  // ── Symbol pool: the bot picks its own coins, the operator sets the slots ──
   const [picks, setPicks] = useState<any[]>([]);
   const [picking, setPicking] = useState(false);
-  const [chosen, setChosen] = useState<string[]>([]);
+  const [picksAt, setPicksAt] = useState(0);
+
+  const autoPick = config?.llmAutoPick !== false;
+  const maxConcurrent = config?.llmMaxConcurrent ?? 2;
+  const repickMinutes = config?.llmRepickMinutes ?? 15;
 
   useEffect(() => {
-    fetch('/api/llm/picks').then(r => r.json()).then(d => {
-      setPicks(d.picks ?? []);
-      setChosen(d.selected ?? []);
-    }).catch(() => {});
+    const loadPicks = () => {
+      fetch('/api/llm/picks').then(r => r.json()).then(d => {
+        setPicks(d.picks ?? []);
+        setPicksAt(d.at ?? 0);
+      }).catch(() => {});
+    };
+    loadPicks();
+    // The bot rebuilds this pool on its own schedule, so poll it rather than
+    // letting the screen claim a shortlist the bot has already replaced.
+    const h = setInterval(loadPicks, 15000);
+    return () => clearInterval(h);
   }, []);
 
-  const handleAskPicks = () => {
+  const setConcurrency = (n: number) => {
+    if (n < 1 || n > 10) return;
+    updateConfig.mutate({ data: { llmMaxConcurrent: n } } as any, {
+      onSuccess: () => {
+        toast.success(`Holding up to ${n} coin${n > 1 ? 's' : ''} at once`);
+        refetchConfig();
+      },
+      onError: (err: any) => toast.error(err?.message ?? 'Could not save'),
+    });
+  };
+
+  const handleRefreshPool = () => {
     setPicking(true);
     fetch('/api/llm/suggest', { method: 'POST' })
       .then(async r => {
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || 'Failed');
         setPicks(d.picks ?? []);
-        setChosen([]);
-        toast.success(`DeepSeek suggested ${d.picks.length} coins (${d.ms}ms)`);
+        setPicksAt(d.at ?? Date.now());
+        toast.success(`Shortlist refreshed — ${d.picks.length} candidates (${d.ms}ms)`);
       })
-      .catch(e => toast.error(e?.message ?? 'Could not get picks'))
+      .catch(e => toast.error(e?.message ?? 'Could not refresh shortlist'))
       .finally(() => setPicking(false));
-  };
-
-  const toggleChosen = (sym: string) =>
-    setChosen(c => c.includes(sym) ? c.filter(x => x !== sym) : [...c, sym]);
-
-  const handleStartSelected = (start: boolean) => {
-    if (!chosen.length) { toast.error('Select at least one coin'); return; }
-    fetch('/api/llm/select', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbols: chosen, start }),
-    })
-      .then(async r => {
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || 'Failed');
-        toast.success(start ? `Trading ${d.symbols.join(', ')} (paper)` : 'Selection saved');
-        refetchConfig();
-      })
-      .catch(e => toast.error(e?.message ?? 'Could not start'));
   };
 
   // ── Discuss a trade with DeepSeek ─────────────────────────────────────────
@@ -484,11 +487,15 @@ export default function Dashboard() {
                 <ValueFlash value={formatUptime(stats?.uptimeSeconds)} className="font-medium" />
               </div>
               <div className="flex flex-col">
-                <span className="text-[10px] text-muted-foreground uppercase leading-none">Trading</span>
+                <span className="text-[10px] text-muted-foreground uppercase leading-none">Holding</span>
+                {/* What is actually held, not the whole shortlist — the pool is
+                    deliberately larger than the slots, so listing it here would
+                    overstate the exposure. */}
                 <span className="font-medium text-xs">
-                  {(config?.llmSymbols?.length ?? 0) > 0
-                    ? config!.llmSymbols!.join(' · ')
-                    : <span className="text-muted-foreground">none selected</span>}
+                  {llmOpen.length > 0
+                    ? <>{llmOpen.map((o: any) => o.symbol).join(' · ')}
+                        <span className="text-muted-foreground"> ({llmOpen.length}/{maxConcurrent})</span></>
+                    : <span className="text-muted-foreground">0/{maxConcurrent} — flat</span>}
                 </span>
               </div>
               <div className="flex flex-col">
@@ -852,69 +859,122 @@ export default function Dashboard() {
             </Badge>
           </CardHeader>
           <CardContent className="space-y-4">
-            {/* Step 1 — ask DeepSeek which coins to trade */}
+            {/* Step 1 — the bot picks its own coins; you set how many it may hold */}
             <div className="rounded-md border border-border p-3 space-y-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-start justify-between gap-3">
                 <div>
-                  <p className="text-xs font-bold">1 · Which coin should we trade?</p>
-                  <p className="text-[10px] text-muted-foreground">
-                    DeepSeek reviews the most liquid perps and picks 5. You choose.
+                  <p className="text-xs font-bold">1 · How many coins at once?</p>
+                  <p className="text-[10px] text-muted-foreground leading-snug">
+                    You set the slots — the bot decides which coins fill them and
+                    refreshes its shortlist every {repickMinutes} min.
                   </p>
                 </div>
-                <Button onClick={handleAskPicks} disabled={picking} size="sm" variant="outline" className="h-8 text-xs font-bold">
-                  {picking ? 'Asking...' : 'Ask DeepSeek'}
-                </Button>
+                <div className="flex items-center gap-1 shrink-0">
+                  <Button
+                    onClick={() => setConcurrency(maxConcurrent - 1)}
+                    disabled={maxConcurrent <= 1 || updateConfig.isPending}
+                    size="sm" variant="outline" className="h-8 w-8 p-0 text-base font-bold"
+                  >−</Button>
+                  <div className="w-10 text-center text-xl font-bold tabular-nums">{maxConcurrent}</div>
+                  <Button
+                    onClick={() => setConcurrency(maxConcurrent + 1)}
+                    disabled={maxConcurrent >= 10 || updateConfig.isPending}
+                    size="sm" variant="outline" className="h-8 w-8 p-0 text-base font-bold"
+                  >+</Button>
+                </div>
               </div>
 
-              {picks.length > 0 && (
-                <>
+              {/* Slot usage — filled vs free, at a glance */}
+              <div className="flex items-center gap-1.5">
+                {Array.from({ length: maxConcurrent }).map((_, i) => {
+                  const pos = llmOpen[i];
+                  return (
+                    <div
+                      key={i}
+                      className={cn(
+                        'flex-1 rounded border px-2 py-1.5 text-center',
+                        pos ? 'border-primary bg-primary/10' : 'border-dashed border-border',
+                      )}
+                    >
+                      {pos ? (
+                        <>
+                          <div className="text-[10px] font-bold truncate">{pos.symbol}</div>
+                          <div className={cn('text-[9px] font-mono',
+                            pos.side === 'long' ? 'text-green-400' : 'text-red-400')}>
+                            {pos.side}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="text-[10px] text-muted-foreground">empty</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* The shortlist the bot is choosing from */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <p className="text-[10px] font-bold text-muted-foreground">
+                    SHORTLIST{picksAt ? ` · updated ${new Date(picksAt).toLocaleTimeString()}` : ''}
+                  </p>
+                  <Button
+                    onClick={handleRefreshPool} disabled={picking}
+                    size="sm" variant="outline" className="h-6 text-[10px]"
+                  >
+                    {picking ? 'Asking...' : 'Refresh now'}
+                  </Button>
+                </div>
+                {picks.length > 0 ? (
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
                     {picks.map((p) => {
-                      const sel = chosen.includes(p.symbol);
+                      const held = llmOpen.some((o: any) => o.symbol === p.symbol);
                       return (
-                        <button
+                        <div
                           key={p.symbol}
-                          onClick={() => toggleChosen(p.symbol)}
                           className={cn(
-                            'text-left rounded-md border p-2 transition-colors',
-                            sel ? 'border-primary bg-primary/10' : 'border-border hover:border-muted-foreground',
+                            'rounded-md border p-2',
+                            held ? 'border-primary bg-primary/10' : 'border-border',
                           )}
                         >
                           <div className="flex items-center justify-between">
                             <span className="text-xs font-bold">{p.symbol}</span>
-                            <span className={cn('text-[10px] font-mono',
-                              p.confidence >= 0.6 ? 'text-green-400' : 'text-muted-foreground')}>
-                              {(p.confidence * 100).toFixed(0)}%
-                            </span>
+                            {held
+                              ? <span className="text-[9px] font-bold text-primary">HELD</span>
+                              : <span className="text-[10px] font-mono text-muted-foreground">
+                                  {(p.confidence * 100).toFixed(0)}%
+                                </span>}
                           </div>
                           <p className="text-[10px] text-muted-foreground mt-1 leading-snug">{p.reason}</p>
-                        </button>
+                        </div>
                       );
                     })}
                   </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button onClick={() => setChosen(picks.map(p => p.symbol))} size="sm" variant="outline" className="h-7 text-[10px]">
-                      Select all 5
-                    </Button>
-                    <Button onClick={() => setChosen([])} size="sm" variant="outline" className="h-7 text-[10px]">
-                      Clear
-                    </Button>
-                    <div className="flex-1" />
-                    <Button
-                      onClick={() => handleStartSelected(true)}
-                      disabled={!chosen.length}
-                      size="sm"
-                      className="h-8 text-xs font-bold bg-primary text-background hover:bg-primary/80"
-                    >
-                      Start trading {chosen.length || ''} selected (Paper)
-                    </Button>
-                  </div>
+                ) : (
                   <p className="text-[10px] text-muted-foreground">
-                    Confidence is the model's own claim about itself — recorded, never trusted.
-                    The scoreboard below is what actually decides whether it works.
+                    {llmEnabled
+                      ? 'Building the shortlist on the next tick...'
+                      : 'Start the loop and the bot will build its own shortlist.'}
                   </p>
-                </>
-              )}
+                )}
+              </div>
+
+              <Button
+                onClick={handleToggleLlm}
+                size="sm"
+                variant={llmEnabled ? 'destructive' : 'default'}
+                className={cn('w-full h-8 text-xs font-bold',
+                  !llmEnabled && 'bg-primary text-background hover:bg-primary/80')}
+              >
+                {llmEnabled
+                  ? 'Stop trading'
+                  : `Start trading — up to ${maxConcurrent} coin${maxConcurrent > 1 ? 's' : ''} (Paper)`}
+              </Button>
+
+              <p className="text-[10px] text-muted-foreground leading-snug">
+                Confidence is the model's own claim about itself — recorded, never trusted.
+                {!autoPick && ' Auto-pick is OFF: the bot is trading a fixed manual list.'}
+              </p>
             </div>
 
             {/* ACTIVE SIGNALS — what the model wants traded right now */}
