@@ -257,7 +257,7 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
   const held = open.find((p) => p.symbol === symbol);
   if (held) {
     const { review, error: rErr, ms: rMs } = await reviewPosition(
-      creds.apiKey, creds.model, ctx,
+      creds.apiKey, cfg.llmDecisionModel || creds.model, ctx,
       {
         symbol: held.symbol, side: held.side, entry: held.entry,
         lastPrice: held.lastPrice ?? held.entry, unrealBps: held.unrealBps ?? 0,
@@ -300,7 +300,8 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
   if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return;
 
   const { decision, error, ms } = await getDecision(
-    creds.apiKey, creds.model, ctx, cfg.llmCostAware, cfg.llmMinRiskReward,
+    creds.apiKey, cfg.llmDecisionModel || creds.model, ctx,
+    cfg.llmCostAware, cfg.llmMinRiskReward,
   );
 
   store.bumpLlmCalls(ms);

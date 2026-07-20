@@ -9,7 +9,7 @@
  */
 
 import { logger } from "./logger";
-import { DEEPSEEK_BASE_URL } from "./llm-credentials";
+import { DEEPSEEK_BASE_URL, CHEAP_MODEL } from "./llm-credentials";
 
 const FUT_KLINES = "https://fapi.binance.com/fapi/v1/klines";
 
@@ -153,7 +153,87 @@ export async function buildEnrichment(symbol: string): Promise<string> {
     }
   };
 
-  await Promise.allSettled([tf("5m", "5m trend"), tf("15m", "15m trend"), spread(), funding(), range()]);
+  /**
+   * BTC regime + relative strength. Alts are heavily correlated to BTC, and the
+   * model previously saw the symbol in complete isolation — a short into an alt
+   * while BTC is ripping is a materially different bet from the same setup with
+   * BTC falling, and it had no way to tell those apart.
+   */
+  const btc = async () => {
+    if (symbol === "BTCUSDT") return;
+    const [b1, s1] = await Promise.all([
+      fetchFuturesKlines("BTCUSDT", "1m", 16),
+      fetchFuturesKlines(symbol, "1m", 16),
+    ]);
+    const ret = (k: Bar[], n: number) =>
+      ((k[k.length - 1].c / k[k.length - 1 - n].c - 1) * 1e4);
+    const b5 = ret(b1, 5), b15 = ret(b1, 15);
+    const a5 = ret(s1, 5), a15 = ret(s1, 15);
+    parts.push(
+      `BTC: ${b5.toFixed(1)} bps over 5m, ${b15.toFixed(1)} bps over 15m. ` +
+      `${symbol} relative to BTC: ${(a5 - b5).toFixed(1)} bps over 5m, ${(a15 - b15).toFixed(1)} bps over 15m ` +
+      `(positive = outperforming BTC). Alts usually follow BTC.`,
+    );
+  };
+
+  /** Crowd positioning + aggressive flow + open-interest direction. */
+  const positioning = async () => {
+    const j = async (u: string) => {
+      const r = await fetch(u, { signal: AbortSignal.timeout(8000) });
+      return r.ok ? r.json() : null;
+    };
+    const [ls, taker, oi] = await Promise.all([
+      j(`https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol=${symbol}&period=5m&limit=1`),
+      j(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${symbol}&period=5m&limit=1`),
+      j(`https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=5m&limit=4`),
+    ]);
+    const lsRow = Array.isArray(ls) ? ls[0] : null;
+    if (lsRow) {
+      parts.push(
+        `Crowd positioning: ${(parseFloat(lsRow.longAccount) * 100).toFixed(0)}% of top accounts long, ` +
+        `${(parseFloat(lsRow.shortAccount) * 100).toFixed(0)}% short. A heavily one-sided book can squeeze against the crowd.`,
+      );
+    }
+    const tRow = Array.isArray(taker) ? taker[0] : null;
+    if (tRow) {
+      parts.push(`Aggressive taker flow (5m): buy/sell ratio ${parseFloat(tRow.buySellRatio).toFixed(3)} (>1 = buyers lifting).`);
+    }
+    if (Array.isArray(oi) && oi.length >= 2) {
+      const first = parseFloat(oi[0].sumOpenInterest);
+      const last = parseFloat(oi[oi.length - 1].sumOpenInterest);
+      if (first > 0) {
+        const chg = ((last / first - 1) * 100).toFixed(2);
+        parts.push(
+          `Open interest ${chg}% over the last ${oi.length * 5}m ` +
+          `(rising OI with rising price = new positions; falling OI = unwinding).`,
+        );
+      }
+    }
+  };
+
+  /** Top-of-book imbalance — near-term pressure the per-bar delta does not show. */
+  const book = async () => {
+    const r = await fetch(
+      `https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=20`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (!r.ok) return;
+    const d = (await r.json()) as { bids: [string, string][]; asks: [string, string][] };
+    const notional = (rows: [string, string][]) =>
+      rows.reduce((a, [p, q]) => a + parseFloat(p) * parseFloat(q), 0);
+    const b = notional(d.bids), a = notional(d.asks);
+    if (b > 0 && a > 0) {
+      parts.push(
+        `Order book (top 20): bids $${b.toFixed(0)} vs asks $${a.toFixed(0)}, ` +
+        `imbalance ${(b / (a + b) * 100).toFixed(0)}% bid-side (>50% = more resting demand).`,
+      );
+    }
+  };
+
+  await Promise.allSettled([
+    tf("5m", "5m trend"), tf("15m", "15m trend"),
+    spread(), funding(), range(), btc(), positioning(), book(),
+  ]);
   return parts.length ? `\nWIDER CONTEXT\n${parts.join("\n")}` : "";
 }
 
@@ -223,7 +303,13 @@ Reply with ONLY JSON:
 
 Choose the 5 you judge most tradeable right now. Only pick symbols from the list.
 Round-trip trading cost is 10 bps, so favour symbols whose typical movement can
-clear that. Be honest in the confidence field — low is fine.`;
+clear that.
+
+IMPORTANT: extreme volatility is NOT desirable. A symbol whose 24h range is huge
+moves too far within a single minute to place a sensible stop — a stop tight
+enough to be useful gets hit by noise, and one wide enough to survive risks far
+too much. Prefer liquid symbols with moderate, orderly ranges over the wildest
+movers. Be honest in the confidence field — low is fine.`;
 
 /** Ask the model for its 5 best symbols to trade now. */
 export async function suggestCoins(
@@ -322,6 +408,20 @@ export async function discussTrade(
   } catch (err) {
     return { answer: null, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started };
   }
+}
+
+/**
+ * Pull the last JSON object out of a reply. The decision prompt now lets the
+ * model reason briefly first, so the response is prose followed by JSON rather
+ * than bare JSON.
+ */
+function extractJson(raw: string): Record<string, unknown> | null {
+  const t = raw.trim();
+  try { return JSON.parse(t) as Record<string, unknown>; } catch { /* not bare JSON */ }
+  const start = t.lastIndexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) return null;
+  try { return JSON.parse(t.slice(start, end + 1)) as Record<string, unknown>; } catch { return null; }
 }
 
 const JSON_SHAPE = `Reply with ONLY a JSON object:
@@ -426,8 +526,11 @@ export async function reviewPosition(
     const ms = Date.now() - started;
     if (!res.ok) return { review: null, error: `DeepSeek HTTP ${res.status}`, ms };
 
-    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    const parsed = JSON.parse(json.choices?.[0]?.message?.content ?? "{}") as Record<string, unknown>;
+    const json = (await res.json()) as {
+      choices?: { message?: { content?: string; reasoning_content?: string } }[];
+    };
+    const rmsg = json.choices?.[0]?.message;
+    const parsed = extractJson(rmsg?.content?.trim() || rmsg?.reasoning_content?.trim() || "") ?? {};
     const action = String(parsed["action"] ?? "").toLowerCase();
     if (!["hold", "exit", "tighten_stop"].includes(action)) {
       return { review: null, error: `bad action: ${action}`, ms };
@@ -459,6 +562,22 @@ export async function getDecision(
   costAware = true,
   minRR = 2,
 ): Promise<{ decision: LlmDecision | null; raw?: string; error?: string; ms: number }> {
+  const first = await getDecisionOnce(apiKey, model, context, costAware, minRR);
+  if (first.decision || model === CHEAP_MODEL) return first;
+  // A reasoning model can still run out of budget before answering. Rather than
+  // lose the decision, fall back once to the fast model.
+  logger.warn({ model, error: first.error }, "Decision unusable — retrying on the fast model");
+  const second = await getDecisionOnce(apiKey, CHEAP_MODEL, context, costAware, minRR);
+  return { ...second, ms: first.ms + second.ms };
+}
+
+async function getDecisionOnce(
+  apiKey: string,
+  model: string,
+  context: string,
+  costAware = true,
+  minRR = 2,
+): Promise<{ decision: LlmDecision | null; raw?: string; error?: string; ms: number }> {
   const started = Date.now();
   try {
     const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
@@ -475,9 +594,12 @@ export async function getDecision(
         ],
         response_format: { type: "json_object" },
         temperature: 0.2,
-        max_tokens: 200,
+        // Reasoning models (deepseek-v4-pro) spend most of the budget in
+        // reasoning_content before emitting the answer. At 700 the reply was
+        // truncated mid-thought every time (finish_reason=length).
+        max_tokens: 4000,
       }),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(60_000),
     });
 
     const ms = Date.now() - started;
@@ -488,14 +610,18 @@ export async function getDecision(
     }
 
     const json = (await res.json()) as {
-      choices?: { message?: { content?: string } }[];
+      choices?: { message?: { content?: string; reasoning_content?: string }; finish_reason?: string }[];
     };
-    const raw = json.choices?.[0]?.message?.content ?? "";
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      return { decision: null, raw, error: "response was not valid JSON", ms };
+    const msg = json.choices?.[0]?.message;
+    const raw = msg?.content?.trim() || msg?.reasoning_content?.trim() || "";
+    const parsed = extractJson(raw);
+    if (!parsed) {
+      const fin = json.choices?.[0]?.finish_reason ?? "?";
+      return {
+        decision: null, raw,
+        error: `no JSON object in response (finish_reason=${fin}, len=${raw.length})`,
+        ms,
+      };
     }
 
     const action = String(parsed["action"] ?? "").toLowerCase();

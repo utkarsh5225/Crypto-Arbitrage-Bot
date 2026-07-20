@@ -45,6 +45,7 @@ router.put("/config", (req, res) => {
     llmMinRiskReward?: unknown;
     llmRejectLowRR?: unknown;
     llmMinStopVolMult?: unknown;
+    llmDecisionModel?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -114,6 +115,10 @@ router.put("/config", (req, res) => {
   if (typeof body.llmMinRiskReward === "number" && body.llmMinRiskReward >= 0.5 && body.llmMinRiskReward <= 10) {
     store.config.llmMinRiskReward = body.llmMinRiskReward;
     logger.info({ minRR: body.llmMinRiskReward }, "LLM min risk:reward changed");
+  }
+  if (typeof body.llmDecisionModel === "string" && /^[a-z0-9.\-]{3,40}$/.test(body.llmDecisionModel)) {
+    store.config.llmDecisionModel = body.llmDecisionModel;
+    logger.info({ model: body.llmDecisionModel }, "LLM decision model changed");
   }
   if (typeof body.llmMinStopVolMult === "number" && body.llmMinStopVolMult >= 0 && body.llmMinStopVolMult <= 20) {
     store.config.llmMinStopVolMult = body.llmMinStopVolMult;

@@ -26,6 +26,9 @@ const KEY_FILE = path.join(process.cwd(), ".credentials-key");
 
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 export const DEFAULT_MODEL = "deepseek-chat";
+/** Stronger model for trade decisions; the cheaper one is fine for coin picking. */
+export const DECISION_MODEL = "deepseek-v4-pro";
+export const CHEAP_MODEL = "deepseek-v4-flash";
 
 interface LlmCredentials {
   apiKey: string;

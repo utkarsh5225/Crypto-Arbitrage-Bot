@@ -50,6 +50,14 @@ export interface BotConfig {
    */
   llmCostAware: boolean;
   /**
+   * Model used for trade decisions.
+   *
+   * Measured: deepseek-v4-pro is a REASONING model and timed out at 60s on
+   * every call, which is unusable on a 60s decision loop. It is still
+   * selectable for longer intervals; the fast model is the default.
+   */
+  llmDecisionModel: string;
+  /**
    * Minimum reward:risk the model is allowed to trade.
    *
    * Measured over its first 34 decisions the model chose reward < risk 27 times
@@ -244,6 +252,7 @@ class Store {
     llmIntervalSec: 60,
     llmMaxTradesPerDay: 200,
     llmCostAware: false,
+    llmDecisionModel: "deepseek-chat",
     llmMinRiskReward: 2.0,
     llmRejectLowRR: false,
     llmMinStopVolMult: 2.0,
@@ -519,6 +528,11 @@ class Store {
    * or articulate its stated reasoning was.
    */
   getLlmStats() {
+    const bucket = (xs: LlmTrade[]) => ({
+      n: xs.length,
+      avgNetBps: xs.length ? xs.reduce((a, b) => a + b.netBps, 0) / xs.length : 0,
+      winRate: xs.length ? xs.filter((x) => x.netBps > 0).length / xs.length : 0,
+    });
     const t = this.llmTrades;
     const n = t.length;
     const dayAgo = Date.now() - 86400_000;
@@ -546,6 +560,14 @@ class Store {
       rrRejected: this.llmRrRejected,
       reviews: this.llmReviews,
       minRiskReward: this.config.llmMinRiskReward,
+      // Does the model's self-reported confidence predict anything? Measured,
+      // not assumed — if these buckets do not separate, confidence is decorative
+      // and should not be used to gate trades.
+      byConfidence: [
+        { band: "<0.5", ...bucket(t.filter((x) => x.confidence < 0.5)) },
+        { band: "0.5-0.7", ...bucket(t.filter((x) => x.confidence >= 0.5 && x.confidence < 0.7)) },
+        { band: ">=0.7", ...bucket(t.filter((x) => x.confidence >= 0.7)) },
+      ],
     };
   }
 
