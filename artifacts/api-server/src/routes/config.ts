@@ -16,6 +16,7 @@ import {
   DEFAULT_MODEL,
 } from "../lib/llm-credentials";
 import { suggestCoins, discussTrade } from "../lib/llm-advisor";
+import { getOpenLlmPositions } from "../lib/llm-trader";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
@@ -40,6 +41,7 @@ router.put("/config", (req, res) => {
     llmSymbol?: unknown;
     llmIntervalSec?: unknown;
     llmMaxTradesPerDay?: unknown;
+    llmCostAware?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -105,6 +107,10 @@ router.put("/config", (req, res) => {
   }
   if (typeof body.llmMaxTradesPerDay === "number" && body.llmMaxTradesPerDay > 0) {
     store.config.llmMaxTradesPerDay = body.llmMaxTradesPerDay;
+  }
+  if (typeof body.llmCostAware === "boolean") {
+    store.config.llmCostAware = body.llmCostAware;
+    logger.info({ llmCostAware: body.llmCostAware }, "LLM prompt mode changed");
   }
 
   // Testnet toggle — only allowed while paper trading, since production and
@@ -341,6 +347,30 @@ router.post("/llm/discuss", async (req, res) => {
 /** GET /api/llm/discuss/:id — existing thread for a trade */
 router.get("/llm/discuss/:id", (req, res) => {
   res.json({ thread: store.llmDiscussions[String(req.params["id"])] ?? [] });
+});
+
+/**
+ * GET /api/llm/open — the ACTIVE signals: what the model wants traded right now,
+ * with entry, stop and target, so the operator can see (or manually place) it.
+ */
+router.get("/llm/open", (_req, res) => {
+  const rows = getOpenLlmPositions().map((p) => ({
+    id: p.id,
+    symbol: p.symbol,
+    side: p.side,
+    entry: p.entry,
+    stop: p.stop,
+    target: p.target,
+    stopBps: p.stopBps,
+    targetBps: p.targetBps,
+    lastPrice: p.lastPrice ?? p.entry,
+    unrealBps: p.unrealBps ?? 0,
+    bars: p.bars,
+    openedAt: p.openedAt,
+    reason: p.reason,
+    confidence: p.confidence,
+  }));
+  res.json({ open: rows });
 });
 
 /** GET /api/llm/stats — scoring for the DeepSeek paper loop */

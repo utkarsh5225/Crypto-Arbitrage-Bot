@@ -92,6 +92,8 @@ export default function Dashboard() {
   const [maxNotional, setMaxNotional] = useState('');
   const [dailyLossLimit, setDailyLossLimit] = useState('');
   const [maxSlippage, setMaxSlippage] = useState('');
+  const [llmInterval, setLlmInterval] = useState('');
+  const [llmMaxTrades, setLlmMaxTrades] = useState('');
 
   useEffect(() => {
     if (config) {
@@ -101,8 +103,23 @@ export default function Dashboard() {
       setMaxNotional(config.maxNotionalPerTrade.toString());
       setDailyLossLimit(config.dailyLossLimitUsd.toString());
       setMaxSlippage(((config.maxSlippagePct ?? 0) * 100).toString());
+      setLlmInterval(String((config as any).llmIntervalSec ?? 60));
+      setLlmMaxTrades(String((config as any).llmMaxTradesPerDay ?? 200));
     }
   }, [config]);
+
+  const handleToggleCostAware = () => {
+    const next = !(config as any)?.llmCostAware;
+    updateConfig.mutate({ data: { llmCostAware: next } } as any, {
+      onSuccess: () => {
+        toast.success(next
+          ? 'Cost-aware prompt — it will mostly decline 1m setups'
+          : 'Naive prompt — it will trade freely');
+        refetchConfig();
+      },
+      onError: (err: any) => toast.error(err?.message ?? 'Could not change prompt mode'),
+    });
+  };
 
   // ── Credentials local state ────────────────────────────────────────────────
   const [apiKeyInput, setApiKeyInput] = useState('');
@@ -156,14 +173,18 @@ export default function Dashboard() {
   const [llmStats, setLlmStats] = useState<any>(null);
   const [llmTrades, setLlmTrades] = useState<any[]>([]);
 
+  const [llmOpen, setLlmOpen] = useState<any[]>([]);
+
   useEffect(() => {
     const pull = () => {
       fetch('/api/llm/stats').then(r => r.json()).then(setLlmStats).catch(() => {});
       fetch('/api/llm/trades?limit=12').then(r => r.json())
         .then(d => setLlmTrades(d.data ?? [])).catch(() => {});
+      fetch('/api/llm/open').then(r => r.json())
+        .then(d => setLlmOpen(d.open ?? [])).catch(() => {});
     };
     pull();
-    const h = setInterval(pull, 10000);
+    const h = setInterval(pull, 5000);
     return () => clearInterval(h);
   }, []);
 
@@ -270,13 +291,11 @@ export default function Dashboard() {
   const handleSaveConfig = () => {
     updateConfig.mutate({
       data: {
-        feeRate: parseFloat(feeRate) / 100,
-        minProfitThreshold: parseFloat(minProfitThreshold) / 100,
-        notionalSize: parseFloat(notionalSize),
         maxNotionalPerTrade: parseFloat(maxNotional),
         dailyLossLimitUsd: parseFloat(dailyLossLimit),
-        maxSlippagePct: parseFloat(maxSlippage) / 100,
-      },
+        llmIntervalSec: parseInt(llmInterval, 10),
+        llmMaxTradesPerDay: parseInt(llmMaxTrades, 10),
+      } as any,
     }, {
       onSuccess: () => toast.success('Configuration updated'),
       onError: (err) => toast.error('Failed to update config: ' + err.message),
@@ -446,13 +465,13 @@ export default function Dashboard() {
             {alertsEnabled ? <Bell className="h-4 w-4" /> : <BellOff className="h-4 w-4" />}
           </button>
 
-          {/* Scanner status */}
+          {/* DeepSeek loop status */}
           <div className="flex items-center gap-3 sm:gap-4 border border-border bg-card px-3 sm:px-4 py-2 rounded-md shadow-sm">
             <div className="flex items-center gap-2 pr-3 sm:pr-4 border-r border-border">
-              <div className={cn('h-2.5 w-2.5 rounded-full animate-pulse', scannerConnected ? 'bg-green-500' : 'bg-destructive')} />
-              <span className="text-sm uppercase tracking-widest text-muted-foreground hidden sm:inline">Scanner</span>
-              <Badge variant={scannerConnected ? 'success' : 'destructive'} className="ml-1">
-                {scannerConnected ? 'Live' : 'Offline'}
+              <div className={cn('h-2.5 w-2.5 rounded-full', llmEnabled ? 'bg-green-500 animate-pulse' : 'bg-muted-foreground')} />
+              <span className="text-sm uppercase tracking-widest text-muted-foreground hidden sm:inline">DeepSeek</span>
+              <Badge variant={llmEnabled ? 'success' : 'outline'} className="ml-1">
+                {llmEnabled ? 'Running' : 'Stopped'}
               </Badge>
             </div>
             <div className="flex items-center gap-3 text-sm">
@@ -461,8 +480,12 @@ export default function Dashboard() {
                 <ValueFlash value={formatUptime(stats?.uptimeSeconds)} className="font-medium" />
               </div>
               <div className="flex flex-col">
-                <span className="text-[10px] text-muted-foreground uppercase leading-none">Pairs</span>
-                <ValueFlash value={stats?.pairsTracked ?? 0} className="font-medium" />
+                <span className="text-[10px] text-muted-foreground uppercase leading-none">Trading</span>
+                <span className="font-medium text-xs">
+                  {(config?.llmSymbols?.length ?? 0) > 0
+                    ? config!.llmSymbols!.join(' · ')
+                    : <span className="text-muted-foreground">none selected</span>}
+                </span>
               </div>
               <div className="flex flex-col">
                 <span className="text-[10px] text-muted-foreground uppercase leading-none">Feed</span>
@@ -521,25 +544,39 @@ export default function Dashboard() {
       )}
 
       {/* ── Stats Strip ──────────────────────────────────────────────────────── */}
-      <div className={cn('grid gap-4', isLive ? 'grid-cols-2 md:grid-cols-6' : 'grid-cols-2 md:grid-cols-5')}>
+      <div className="grid gap-4 grid-cols-2 md:grid-cols-5">
         <StatCard
-          label={isLive ? 'Live P&L' : 'Paper P&L'}
-          value={formatUsd(isLive ? stats?.liveProfitUsd : stats?.paperProfitUsd)}
-          valueClass={cn(((isLive ? stats?.liveProfitUsd : stats?.paperProfitUsd) ?? 0) >= 0 ? 'text-green-400' : 'text-destructive')}
-          sublabel={stats && stats.totalTrades > 0 ? `Win ${(stats.winRate * 100).toFixed(0)}% · ${stats.totalTrades} trades` : undefined}
+          label="Open Signals"
+          value={llmOpen.length}
+          valueClass={llmOpen.length > 0 ? 'text-primary' : 'text-muted-foreground'}
+          sublabel={llmOpen.length > 0 ? llmOpen.map((o: any) => o.symbol).join(', ') : 'waiting for a call'}
         />
-        <StatCard label="Total Trades" value={stats?.totalTrades ?? 0} />
-        <StatCard label="Opportunities" value={stats?.totalOpportunities ?? 0} />
-        <StatCard label="Paths / Sec" value={(stats?.pathsPerSecond ?? 0).toFixed(0)} />
-        <StatCard label="Opp / Min" value={(stats?.opportunitiesPerMinute ?? 0).toFixed(2)} />
-        {isLive && (
-          <StatCard
-            label="Daily Loss"
-            value={formatUsd(stats?.dailyLossUsd)}
-            valueClass={cn((stats?.dailyLossUsd ?? 0) > 0 ? 'text-destructive' : 'text-muted-foreground')}
-            sublabel={`Limit: ${formatUsd(config?.dailyLossLimitUsd)}`}
-          />
-        )}
+        <StatCard
+          label="Closed Trades"
+          value={llmStats?.trades ?? 0}
+          sublabel={(llmStats?.trades ?? 0) > 0
+            ? `Win ${((llmStats?.winRate ?? 0) * 100).toFixed(0)}% · ${llmStats?.skips ?? 0} flat`
+            : `${llmStats?.skips ?? 0} flat calls`}
+        />
+        <StatCard
+          label="Avg Net / Trade"
+          value={`${(llmStats?.avgNetBps ?? 0).toFixed(1)} bps`}
+          valueClass={(llmStats?.avgNetBps ?? 0) > 0 ? 'text-green-400' : 'text-destructive'}
+          sublabel={`after ${llmStats?.roundTripCostBps ?? 10} bps cost`}
+        />
+        <StatCard
+          label="Edge vs Random"
+          value={`${(llmStats?.edgeVsRandom ?? 0) >= 0 ? '+' : ''}${(llmStats?.edgeVsRandom ?? 0).toFixed(1)} bps`}
+          valueClass={(llmStats?.edgeVsRandom ?? 0) > 0 ? 'text-green-400' : 'text-destructive'}
+          sublabel={(llmStats?.trades ?? 0) < 100
+            ? `only ${llmStats?.trades ?? 0}/100 trades — noise`
+            : 'sample is meaningful'}
+        />
+        <StatCard
+          label="Model Latency"
+          value={`${llmStats?.avgLatencyMs ?? 0} ms`}
+          sublabel={`${llmStats?.calls ?? 0} calls made`}
+        />
       </div>
 
 
@@ -559,21 +596,42 @@ export default function Dashboard() {
             </CardHeader>
             <CardContent className="space-y-5 pt-2">
 
-              {/* Algorithm Settings */}
+              {/* DeepSeek loop settings */}
               <div>
-                <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Algorithm</p>
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">DeepSeek Loop</p>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div className="space-y-1.5">
-                    <Label htmlFor="notionalSize" className="text-xs">Notional ($)</Label>
-                    <Input id="notionalSize" value={notionalSize} onChange={e => setNotionalSize(e.target.value)} type="number" step="10" className="bg-background/50 h-8 text-xs" />
+                    <Label htmlFor="llmInterval" className="text-xs">Decision Interval (s)</Label>
+                    <Input
+                      id="llmInterval" type="number" step="30" min="30"
+                      value={llmInterval} onChange={e => setLlmInterval(e.target.value)}
+                      className="bg-background/50 h-8 text-xs"
+                    />
+                    <p className="text-[9px] text-muted-foreground">60 = 1-minute cadence. Restart applies it.</p>
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="feeRate" className="text-xs">Fee Rate (%)</Label>
-                    <Input id="feeRate" value={feeRate} onChange={e => setFeeRate(e.target.value)} type="number" step="0.01" className="bg-background/50 h-8 text-xs" />
+                    <Label htmlFor="llmMaxTrades" className="text-xs">Max Trades / Day</Label>
+                    <Input
+                      id="llmMaxTrades" type="number" step="10" min="1"
+                      value={llmMaxTrades} onChange={e => setLlmMaxTrades(e.target.value)}
+                      className="bg-background/50 h-8 text-xs"
+                    />
+                    <p className="text-[9px] text-muted-foreground">Caps how much a chatty model can trade.</p>
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="minProfit" className="text-xs">Min Profit (%)</Label>
-                    <Input id="minProfit" value={minProfitThreshold} onChange={e => setMinProfitThreshold(e.target.value)} type="number" step="0.01" className="bg-background/50 h-8 text-xs" />
+                    <Label className="text-xs">Prompt Mode</Label>
+                    <Button
+                      onClick={handleToggleCostAware}
+                      size="sm" variant="outline"
+                      className="h-8 w-full text-[11px] font-bold"
+                    >
+                      {config?.llmCostAware ? 'Cost-aware' : 'Naive (trades freely)'}
+                    </Button>
+                    <p className="text-[9px] text-muted-foreground">
+                      {config?.llmCostAware
+                        ? 'Tells it the 10 bps cost — it will decline most 1m setups.'
+                        : 'No cost constraint — it trades, which is what generates data.'}
+                    </p>
                   </div>
                 </div>
               </div>
@@ -581,9 +639,12 @@ export default function Dashboard() {
               {/* Safety Controls */}
               <div>
                 <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1">
-                  <ShieldAlert className="h-3 w-3" /> Safety Controls
+                  <ShieldAlert className="h-3 w-3" /> Risk Limits
+                  <span className="normal-case tracking-normal text-muted-foreground/70">
+                    — apply when live futures execution is wired up
+                  </span>
                 </p>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div className="space-y-1.5">
                     <Label htmlFor="maxNotional" className="text-xs">Max Notional / Trade ($)</Label>
                     <Input id="maxNotional" value={maxNotional} onChange={e => setMaxNotional(e.target.value)} type="number" step="10" className="bg-background/50 h-8 text-xs" />
@@ -601,8 +662,6 @@ export default function Dashboard() {
                     </button>
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="maxSlippage" className="text-xs">Max Slippage (%)</Label>
-                    <Input id="maxSlippage" value={maxSlippage} onChange={e => setMaxSlippage(e.target.value)} type="number" step="0.1" className="bg-background/50 h-8 text-xs" title="Abort a live triangle if a leg fills worse than expected by more than this. 0 disables." />
                   </div>
                 </div>
               </div>
@@ -851,6 +910,73 @@ export default function Dashboard() {
                     The scoreboard below is what actually decides whether it works.
                   </p>
                 </>
+              )}
+            </div>
+
+            {/* ACTIVE SIGNALS — what the model wants traded right now */}
+            <div className="rounded-md border-2 border-primary/50 bg-primary/5 p-3">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs font-bold flex items-center gap-1.5">
+                  <Zap className="h-3.5 w-3.5 text-primary" />
+                  ACTIVE SIGNALS — take these trades
+                </p>
+                <Badge variant="outline" className="text-[10px]">{llmOpen.length} open</Badge>
+              </div>
+
+              {llmOpen.length === 0 ? (
+                <p className="text-[11px] text-muted-foreground">
+                  No open signal right now. When DeepSeek makes a call it appears here with
+                  exact entry, stop and target.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {llmOpen.map((o) => (
+                    <div key={o.id} className="rounded border border-border bg-background/60 p-2.5">
+                      <div className="flex flex-wrap items-center gap-2 mb-2">
+                        <span className={cn('px-2 py-0.5 rounded text-xs font-bold',
+                          o.side === 'long' ? 'bg-green-500/20 text-green-400' : 'bg-destructive/20 text-destructive')}>
+                          {String(o.side).toUpperCase()}
+                        </span>
+                        <span className="text-sm font-bold">{o.symbol}</span>
+                        <span className="text-[10px] text-muted-foreground">
+                          {o.bars}m ago · conf {(o.confidence * 100).toFixed(0)}%
+                        </span>
+                        <div className="flex-1" />
+                        <span className={cn('text-sm font-bold font-mono',
+                          o.unrealBps >= 0 ? 'text-green-400' : 'text-destructive')}>
+                          {o.unrealBps >= 0 ? '+' : ''}{Number(o.unrealBps).toFixed(1)} bps
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+                        <div>
+                          <p className="text-[9px] uppercase text-muted-foreground">Entry</p>
+                          <p className="font-bold">{Number(o.entry).toPrecision(6)}</p>
+                        </div>
+                        <div>
+                          <p className="text-[9px] uppercase text-muted-foreground">Stop loss</p>
+                          <p className="font-bold text-destructive">{Number(o.stop).toPrecision(6)}</p>
+                          <p className="text-[9px] text-muted-foreground">−{Number(o.stopBps).toFixed(0)} bps</p>
+                        </div>
+                        <div>
+                          <p className="text-[9px] uppercase text-muted-foreground">Target</p>
+                          <p className="font-bold text-green-400">{Number(o.target).toPrecision(6)}</p>
+                          <p className="text-[9px] text-muted-foreground">+{Number(o.targetBps).toFixed(0)} bps</p>
+                        </div>
+                        <div>
+                          <p className="text-[9px] uppercase text-muted-foreground">Now</p>
+                          <p className="font-bold">{Number(o.lastPrice).toPrecision(6)}</p>
+                        </div>
+                      </div>
+
+                      <p className="text-[10px] text-muted-foreground mt-2 italic">"{o.reason}"</p>
+                    </div>
+                  ))}
+                  <p className="text-[10px] text-muted-foreground">
+                    Paper only — the bot is not placing these on the exchange. Copy the levels
+                    manually if you want to act on one.
+                  </p>
+                </div>
               )}
             </div>
 

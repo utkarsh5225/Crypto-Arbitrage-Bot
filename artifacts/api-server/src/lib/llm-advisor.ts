@@ -263,15 +263,43 @@ export async function discussTrade(
   }
 }
 
-const SYSTEM_PROMPT = `You are a futures scalping assistant. You will be shown recent 1-minute bars as basis-point offsets plus order-flow delta.
-
-Reply with ONLY a JSON object:
+const JSON_SHAPE = `Reply with ONLY a JSON object:
 {"action":"long"|"short"|"flat","stop_bps":<number>,"target_bps":<number>,"confidence":<0-1>,"reason":"<max 20 words>"}
+stop_bps and target_bps are distances from entry in basis points, both positive.`;
+
+/**
+ * Cost-aware prompt. Tells the model what a round trip actually costs and that
+ * flat is an acceptable answer. In practice this makes it decline nearly every
+ * 1-minute setup, which is arithmetically correct (median 1m move ~1.4-2.6 bps
+ * vs 10 bps cost) but produces no data to score.
+ */
+const PROMPT_COST_AWARE = `You are a futures scalping assistant. You will be shown recent 1-minute bars as basis-point offsets plus order-flow delta.
+
+${JSON_SHAPE}
 
 Rules:
-- stop_bps and target_bps are distances from entry in basis points, both positive.
 - Round-trip cost is 10 bps. If you cannot justify a target meaningfully above that, return "flat".
 - Prefer "flat" when there is no clear signal. Flat is a valid and often correct answer.`;
+
+/**
+ * Naive prompt — no cost constraint, matching how a typical "AI trading bot"
+ * is actually built. This one WILL trade, which is the point: it generates the
+ * decisions needed to score the model against the coin-flip control.
+ */
+const PROMPT_NAIVE = `You are an expert futures scalper trading the 1-minute timeframe. You will be shown recent 1-minute bars as basis-point offsets plus order-flow delta.
+
+${JSON_SHAPE}
+
+Rules:
+- Read the price action and order-flow delta and make a directional call.
+- Set a stop and a target that fit the recent volatility.
+- Only return "flat" if the data is genuinely unreadable.`;
+
+export function systemPromptFor(costAware: boolean): string {
+  return costAware ? PROMPT_COST_AWARE : PROMPT_NAIVE;
+}
+
+const SYSTEM_PROMPT = PROMPT_COST_AWARE;
 
 /**
  * Ask DeepSeek for a decision. Returns null on any failure — a broken or
@@ -281,6 +309,7 @@ export async function getDecision(
   apiKey: string,
   model: string,
   context: string,
+  costAware = true,
 ): Promise<{ decision: LlmDecision | null; raw?: string; error?: string; ms: number }> {
   const started = Date.now();
   try {
@@ -293,7 +322,7 @@ export async function getDecision(
       body: JSON.stringify({
         model,
         messages: [
-          { role: "system", content: SYSTEM_PROMPT },
+          { role: "system", content: systemPromptFor(costAware) },
           { role: "user", content: context },
         ],
         response_format: { type: "json_object" },

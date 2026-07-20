@@ -42,6 +42,13 @@ export interface BotConfig {
   llmIntervalSec: number;
   /** Hard cap on simulated trades per day, so a chatty model cannot spam. */
   llmMaxTradesPerDay: number;
+  /**
+   * Whether the decision prompt states the 10 bps round-trip cost.
+   * true  = model declines almost every 1m setup (correct, but yields no data)
+   * false = model trades freely, as a typical "AI trading bot" would, which is
+   *         what lets the coin-flip scoreboard actually measure it
+   */
+  llmCostAware: boolean;
 }
 
 /** One completed LLM paper trade, with its coin-flip control. */
@@ -202,6 +209,7 @@ class Store {
     llmSymbols: [],
     llmIntervalSec: 60,
     llmMaxTradesPerDay: 200,
+    llmCostAware: false,
   };
 
   /** Latest coin picks returned by DeepSeek, awaiting operator selection. */

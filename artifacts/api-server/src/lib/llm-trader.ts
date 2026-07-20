@@ -44,6 +44,12 @@ export interface OpenPosition {
   ctrlTarget: number;
   ctrlOpen: boolean;
   ctrlResultBps?: number;
+  /** Latest mark price + unrealised move, refreshed each tick for the UI. */
+  lastPrice?: number;
+  unrealBps?: number;
+  /** Distances the model asked for, kept so the UI can show them directly. */
+  stopBps: number;
+  targetBps: number;
 }
 
 const open: OpenPosition[] = [];
@@ -78,6 +84,11 @@ function updateOpen(bars: Bar[], symbol: string): void {
     const p = open[i];
     if (p.symbol !== symbol) continue;   // only mark against its own market
     p.bars += 1;
+
+    // Keep a live mark so the dashboard can show the open signal's P&L.
+    p.lastPrice = bar.c;
+    p.unrealBps =
+      ((p.side === "long" ? bar.c - p.entry : p.entry - bar.c) / p.entry) * 1e4;
 
     if (p.ctrlOpen) {
       const c = resolveCtrl(p, bar);
@@ -145,7 +156,9 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
   if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return;
 
   const ctx = buildContext(symbol, bars);
-  const { decision, error, ms } = await getDecision(creds.apiKey, creds.model, ctx);
+  const { decision, error, ms } = await getDecision(
+    creds.apiKey, creds.model, ctx, cfg.llmCostAware,
+  );
 
   store.bumpLlmCalls(ms);
   if (!decision) {
@@ -182,6 +195,10 @@ async function tickSymbol(symbol: string, creds: { apiKey: string; model: string
       ctrlStop: ctrlSide === "long" ? entry - stopD : entry + stopD,
       ctrlTarget: ctrlSide === "long" ? entry + tgtD : entry - tgtD,
       ctrlOpen: true,
+      lastPrice: entry,
+      unrealBps: 0,
+      stopBps: decision.stopBps,
+      targetBps: decision.targetBps,
     });
 
     logger.info(
