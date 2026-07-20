@@ -180,12 +180,16 @@ export default function Dashboard() {
       fetch('/api/llm/stats').then(r => r.json()).then(setLlmStats).catch(() => {});
       fetch('/api/llm/trades?limit=12').then(r => r.json())
         .then(d => setLlmTrades(d.data ?? [])).catch(() => {});
+    };
+    const pullOpen = () => {
       fetch('/api/llm/open').then(r => r.json())
         .then(d => setLlmOpen(d.open ?? [])).catch(() => {});
     };
-    pull();
-    const h = setInterval(pull, 5000);
-    return () => clearInterval(h);
+    pull(); pullOpen();
+    const h = setInterval(pull, 10000);
+    // Open positions carry the live mark, so refresh them more often.
+    const ho = setInterval(pullOpen, 3000);
+    return () => { clearInterval(h); clearInterval(ho); };
   }, []);
 
   const llmEnabled = !!config?.llmEnabled;
@@ -939,8 +943,17 @@ export default function Dashboard() {
                         </span>
                         <span className="text-sm font-bold">{o.symbol}</span>
                         <span className="text-[10px] text-muted-foreground">
-                          {o.bars}m ago · conf {(o.confidence * 100).toFixed(0)}%
+                          {(() => {
+                            const s = Math.max(0, Math.floor((now - o.openedAt) / 1000));
+                            return s < 60 ? `${s}s ago` : `${Math.floor(s / 60)}m ${s % 60}s ago`;
+                          })()} · conf {(o.confidence * 100).toFixed(0)}%
                         </span>
+                        {o.riskReward != null && (
+                          <span className={cn('text-[10px] font-bold px-1.5 py-0.5 rounded',
+                            o.riskReward >= 2 ? 'bg-green-500/15 text-green-400' : 'bg-amber-500/15 text-amber-400')}>
+                            R:R {Number(o.riskReward).toFixed(2)}
+                          </span>
+                        )}
                         <div className="flex-1" />
                         <span className={cn('text-sm font-bold font-mono',
                           o.unrealBps >= 0 ? 'text-green-400' : 'text-destructive')}>
@@ -970,6 +983,12 @@ export default function Dashboard() {
                       </div>
 
                       <p className="text-[10px] text-muted-foreground mt-2 italic">"{o.reason}"</p>
+                      {o.lastReview && (
+                        <p className="text-[10px] mt-1.5 text-primary/90">
+                          <span className="uppercase tracking-wider text-muted-foreground">Latest review: </span>
+                          {o.lastReview}
+                        </p>
+                      )}
                     </div>
                   ))}
                   <p className="text-[10px] text-muted-foreground">

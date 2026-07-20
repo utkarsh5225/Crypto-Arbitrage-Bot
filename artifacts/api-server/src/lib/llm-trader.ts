@@ -32,7 +32,11 @@ const ROUND_TRIP_BPS = 10;
 const MAX_HOLD_BARS = 30;
 
 let timer: NodeJS.Timeout | null = null;
+let markTimer: NodeJS.Timeout | null = null;
 let inFlight = false;
+
+/** How often open positions are re-marked for display (independent of the LLM). */
+const MARK_REFRESH_MS = 5_000;
 
 export interface OpenPosition {
   id: string;
@@ -151,6 +155,41 @@ function updateOpen(bars: Bar[], symbol: string): void {
     );
     open.splice(i, 1);
     sseManager.broadcast("llm_stats", store.getLlmStats());
+  }
+}
+
+/**
+ * Re-mark open positions against the live price.
+ *
+ * The decision loop only runs every `llmIntervalSec` (60s by default), so
+ * without this the displayed price and unrealised P&L sat frozen for a whole
+ * minute at a time. This is display-only and makes no LLM call.
+ *
+ * Stop/target RESOLUTION deliberately stays on the 1m bar in updateOpen(),
+ * which uses the bar's high/low and therefore catches intrabar wicks that a
+ * 5-second poll would miss.
+ */
+async function refreshMarks(): Promise<void> {
+  if (open.length === 0) return;
+  try {
+    const res = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) return;
+    const rows = (await res.json()) as { symbol: string; price: string }[];
+    const px = new Map(rows.map((r) => [r.symbol, parseFloat(r.price)]));
+
+    let changed = false;
+    for (const p of open) {
+      const now = px.get(p.symbol);
+      if (!now || !(now > 0)) continue;
+      p.lastPrice = now;
+      p.unrealBps = ((p.side === "long" ? now - p.entry : p.entry - now) / p.entry) * 1e4;
+      changed = true;
+    }
+    if (changed) sseManager.broadcast("llm_open", getOpenLlmPositions());
+  } catch {
+    // Best effort — a missed refresh just leaves the previous mark in place.
   }
 }
 
@@ -356,11 +395,17 @@ export function startLlmTrader(): void {
   if (timer) return;
   const sec = Math.max(30, store.config.llmIntervalSec);
   timer = setInterval(() => { void tick(); }, sec * 1000);
-  logger.info({ intervalSec: sec }, "LLM trader started (PAPER only)");
+  // Independent of the decision cadence so open positions show a live price.
+  markTimer = setInterval(() => { void refreshMarks(); }, MARK_REFRESH_MS);
+  logger.info(
+    { intervalSec: sec, markRefreshMs: MARK_REFRESH_MS },
+    "LLM trader started (PAPER only)",
+  );
 }
 
 export function stopLlmTrader(): void {
   if (timer) { clearInterval(timer); timer = null; }
+  if (markTimer) { clearInterval(markTimer); markTimer = null; }
 }
 
 export function getOpenLlmPositions(): OpenPosition[] {
