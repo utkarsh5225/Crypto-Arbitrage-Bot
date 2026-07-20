@@ -481,7 +481,18 @@ Rules:
 - "hold" if the original thesis still stands.
 - "exit" to close now at market, if the thesis has broken.
 - "tighten_stop" to reduce risk, giving new_stop_bps SMALLER than the current stop distance. You may never widen a stop.
-- Closing costs 10 bps, so do not exit on noise alone.`;
+
+COST REALITY - read this before choosing "exit":
+- Closing costs 10 bps. Your average trade so far has captured about 0 bps
+  gross, so that 10 bps is not a rounding error, it is the whole result.
+- You chose the stop distance yourself. It represents how much noise you
+  expected to sit through. A move far SMALLER than your own stop is, by your
+  own sizing, noise - not a broken thesis.
+- "hold" is the default. Choose "exit" only if something has changed that you
+  would not have taken the trade knowing, and the move against you is a
+  meaningful fraction of your stop.
+- Early exits that are flat-to-slightly-green still LOSE, because of the fee.
+  Letting the stop or target decide costs nothing extra.`;
 
 /**
  * Ask the model what to do with a position it already holds.

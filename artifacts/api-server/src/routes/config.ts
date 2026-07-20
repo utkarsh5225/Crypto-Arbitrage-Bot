@@ -49,6 +49,8 @@ router.put("/config", (req, res) => {
     llmAutoPick?: unknown;
     llmMaxConcurrent?: unknown;
     llmRepickMinutes?: unknown;
+    llmMinHoldBars?: unknown;
+    llmExitMinAdverseFrac?: unknown;
   };
 
   if (typeof body.feeRate === "number" && body.feeRate > 0 && body.feeRate < 1) {
@@ -149,6 +151,22 @@ router.put("/config", (req, res) => {
     body.llmRepickMinutes <= 240
   ) {
     store.config.llmRepickMinutes = body.llmRepickMinutes;
+  }
+  if (
+    typeof body.llmMinHoldBars === "number" &&
+    Number.isInteger(body.llmMinHoldBars) &&
+    body.llmMinHoldBars >= 0 &&
+    body.llmMinHoldBars <= 60
+  ) {
+    store.config.llmMinHoldBars = body.llmMinHoldBars;
+    logger.info({ minHoldBars: body.llmMinHoldBars }, "LLM minimum hold changed");
+  }
+  if (
+    typeof body.llmExitMinAdverseFrac === "number" &&
+    body.llmExitMinAdverseFrac >= 0 &&
+    body.llmExitMinAdverseFrac <= 1
+  ) {
+    store.config.llmExitMinAdverseFrac = body.llmExitMinAdverseFrac;
   }
   if (typeof body.llmMinStopVolMult === "number" && body.llmMinStopVolMult >= 0 && body.llmMinStopVolMult <= 20) {
     store.config.llmMinStopVolMult = body.llmMinStopVolMult;

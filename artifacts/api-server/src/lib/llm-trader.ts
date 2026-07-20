@@ -339,6 +339,13 @@ async function tickSymbol(
   // ── Manage an already-open position rather than ignoring it ────────────────
   const held = open.find((p) => p.symbol === symbol);
   if (held) {
+    // ── Minimum hold ─────────────────────────────────────────────────────────
+    // Do not even ASK before this. The review call is not free of consequence:
+    // an LLM asked "should you exit?" every 60 seconds eventually says yes, and
+    // each yes costs the 10 bps round trip. Reviewing a position with a 300 bps
+    // stop after one minute is asking about noise.
+    if (held.bars < cfg.llmMinHoldBars) return "none";
+
     const { review, error: rErr, ms: rMs } = await reviewPosition(
       creds.apiKey, cfg.llmDecisionModel || creds.model, ctx,
       {
@@ -358,8 +365,33 @@ async function tickSymbol(
     held.lastReviewAt = Date.now();
 
     if (review.action === "exit") {
-      closeNow(held, held.lastPrice ?? held.entry, "llm_exit");
-      logger.info({ symbol, reason: review.reason }, "DeepSeek closed its own position");
+      // ── Exit gate ──────────────────────────────────────────────────────────
+      // Enforced here, not just stated in the prompt — the same lesson as the
+      // R:R rule, which the model ignored 27 times out of 34 when it was only
+      // asked nicely.
+      //
+      // An exit is allowed when the thesis is genuinely breaking (price has
+      // travelled a meaningful fraction of the way to the stop) or when the
+      // profit clearly clears the round trip. Anything else is churn: the six
+      // early exits so far averaged +0.31 bps gross and -9.69 bps net.
+      const unreal = held.unrealBps ?? 0;
+      const adverseEnough = unreal <= -held.stopBps * cfg.llmExitMinAdverseFrac;
+      const profitEnough = unreal >= ROUND_TRIP_BPS * 2;
+
+      if (adverseEnough || profitEnough) {
+        closeNow(held, held.lastPrice ?? held.entry, "llm_exit");
+        logger.info({ symbol, unrealBps: +unreal.toFixed(1), reason: review.reason },
+          "DeepSeek closed its own position");
+      } else {
+        store.bumpExitsBlocked();
+        held.lastReview = `exit blocked (noise): ${review.reason}`;
+        logger.info(
+          { symbol, unrealBps: +unreal.toFixed(1), stopBps: +held.stopBps.toFixed(1),
+            needAdverseBps: +(-held.stopBps * cfg.llmExitMinAdverseFrac).toFixed(1),
+            reason: review.reason },
+          "Blocked exit — move is inside the model's own stop distance",
+        );
+      }
     } else if (review.action === "tighten_stop" && review.newStopBps) {
       // Only ever reduce risk. Widening a stop turns a small loss into a large
       // one — exactly the failure mode the R:R enforcement exists to prevent.

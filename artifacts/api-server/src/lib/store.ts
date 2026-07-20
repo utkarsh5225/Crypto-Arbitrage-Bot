@@ -61,6 +61,23 @@ export interface BotConfig {
   llmMaxConcurrent: number;
   /** Minutes before the candidate pool is refreshed. Held symbols are kept. */
   llmRepickMinutes: number;
+  /**
+   * Bars a position must be held before the model may review it at all.
+   *
+   * Measured over the first 9 trades: 6 were closed by the model itself at an
+   * average of 1.5 bars for +0.31 bps gross, then charged the 10 bps round
+   * trip. Those six were 49% of the total loss. Asked "should you exit?" every
+   * 60 seconds, the model eventually says yes - so it is not asked so soon.
+   */
+  llmMinHoldBars: number;
+  /**
+   * An exit must clear this fraction of the stop distance before it is allowed.
+   *
+   * The model was sizing a ~300 bps stop and then exiting on a 31 bps wiggle.
+   * Those two beliefs cannot both be true: the stop says "I expect noise up to
+   * 300 bps", the exit says "30 bps of noise broke my thesis".
+   */
+  llmExitMinAdverseFrac: number;
   /** Seconds between decisions (min 30; 60 = the 1m scalping cadence). */
   llmIntervalSec: number;
   /** Hard cap on simulated trades per day, so a chatty model cannot spam. */
@@ -275,6 +292,8 @@ class Store {
     llmAutoPick: true,
     llmMaxConcurrent: 2,
     llmRepickMinutes: 15,
+    llmMinHoldBars: 5,
+    llmExitMinAdverseFrac: 0.5,
     llmIntervalSec: 60,
     llmMaxTradesPerDay: 200,
     llmCostAware: false,
@@ -306,6 +325,7 @@ class Store {
   llmRrRejected = 0;
   llmReviews = 0;
   llmStopWidened = 0;
+  llmExitsBlocked = 0;
 
   opportunities: ArbitrageOpportunity[] = [];
   trades: PaperTrade[] = [];
@@ -548,6 +568,7 @@ class Store {
   bumpRrRejected(): void { this.llmRrRejected += 1; }
   bumpLlmReviews(): void { this.llmReviews += 1; }
   bumpStopWidened(): void { this.llmStopWidened += 1; }
+  bumpExitsBlocked(): void { this.llmExitsBlocked += 1; }
 
   bumpLlmCalls(ms: number): void {
     this.llmCalls += 1;
@@ -589,6 +610,7 @@ class Store {
       shorts: t.filter((x) => x.side === "short").length,
       avgOppNetBps: n ? mean(t.map((x) => x.oppNetBps ?? 0)) : 0,
       stopWidened: this.llmStopWidened,
+      exitsBlocked: this.llmExitsBlocked,
       rrAdjusted: this.llmRrAdjusted,
       rrRejected: this.llmRrRejected,
       reviews: this.llmReviews,
