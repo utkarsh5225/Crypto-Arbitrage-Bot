@@ -184,6 +184,9 @@ export interface LlmTrade {
   lastReview?: string;
   /** What triggered the entry — set when the breakout filter is on. */
   setup?: "breakout" | "breakdown";
+  /** Break-quality factors, recorded so loud-vs-quiet can be scored on OUR trades. */
+  setupSqueeze?: number;
+  setupImpulse?: number;
   /** Round-trip cost actually charged (maker/taker aware), bps. */
   costBps?: number;
 }
@@ -674,6 +677,15 @@ class Store {
         : 1,
       avgNonFillWouldBeBps: mean(this.llmNonFillResults),
       // Breakout trades vs everything else — the whole point of the filter.
+      // Loud breaks (expanded range + impulsive bar) historically REVERT; quiet
+      // ones mildly continue. Recorded per trade so the pattern can be checked
+      // on our own fills, not just the backtest.
+      byBreakQuality: [
+        { quality: "loud", ...bucket(t.filter((x) =>
+            x.setup && (x.setupSqueeze ?? 1) >= 0.7 && (x.setupImpulse ?? 1) >= 1.5)) },
+        { quality: "quiet", ...bucket(t.filter((x) =>
+            x.setup && !((x.setupSqueeze ?? 1) >= 0.7 && (x.setupImpulse ?? 1) >= 1.5))) },
+      ],
       bySetup: [
         { setup: "breakout", ...bucket(t.filter((x) => x.setup === "breakout")) },
         { setup: "breakdown", ...bucket(t.filter((x) => x.setup === "breakdown")) },

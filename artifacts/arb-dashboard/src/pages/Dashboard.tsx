@@ -1151,6 +1151,18 @@ export default function Dashboard() {
                   Measurement — is any of this actually working?
                 </p>
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                  {(llmStats?.byBreakQuality ?? []).filter((b: any) => b.n > 0).map((b: any) => (
+                    <div key={b.quality} className="rounded border border-border p-2">
+                      <p className="text-[9px] uppercase text-muted-foreground">{b.quality} breaks</p>
+                      <p className={cn('font-bold font-mono',
+                        b.avgNetBps > 0 ? 'text-green-400' : 'text-destructive')}>
+                        {b.avgNetBps >= 0 ? '+' : ''}{Number(b.avgNetBps).toFixed(1)} bps
+                      </p>
+                      <p className="text-[9px] text-muted-foreground">
+                        n={b.n} · win {(b.winRate * 100).toFixed(0)}%
+                      </p>
+                    </div>
+                  ))}
                   {(llmStats?.bySetup ?? []).filter((b: any) => b.n > 0).map((b: any) => (
                     <div key={b.setup} className="rounded border border-border p-2">
                       <p className="text-[9px] uppercase text-muted-foreground">{b.setup} trades</p>

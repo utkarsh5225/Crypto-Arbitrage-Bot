@@ -112,6 +112,9 @@ export interface OpenPosition {
   makerEntry: boolean;
   /** What triggered the entry, when the breakout filter is on. */
   setup?: "breakout" | "breakdown";
+  /** Break-quality factors that measurably separated categories (loud vs quiet). */
+  setupSqueeze?: number;
+  setupImpulse?: number;
 }
 
 /**
@@ -134,6 +137,8 @@ interface PendingEntry {
   reason: string;
   confidence: number;
   setup?: "breakout" | "breakdown";
+  setupSqueeze?: number;
+  setupImpulse?: number;
   barsWaiting: number;
   placedAt: number;
 }
@@ -250,6 +255,8 @@ function updateOpen(bars: Bar[], symbol: string): void {
       stopBps: p.stopBps,
       lastReview: p.lastReview,
       setup: p.setup,
+      setupSqueeze: p.setupSqueeze,
+      setupImpulse: p.setupImpulse,
       costBps: cost,
     });
     logger.info(
@@ -317,6 +324,8 @@ function closeNow(p: OpenPosition, px: number, how: string): void {
     stopBps: p.stopBps,
     lastReview: p.lastReview,
     setup: p.setup,
+    setupSqueeze: p.setupSqueeze,
+    setupImpulse: p.setupImpulse,
     costBps: cost,
   });
   const i = open.indexOf(p);
@@ -333,26 +342,86 @@ function closeNow(p: OpenPosition, px: number, how: string): void {
  * made, never WHICH WAY — forcing the break direction would bake in an edge
  * the data says is not there.
  */
-function detectBreak(
-  bars: Bar[],
-  lookback: number,
-): { setup: "breakout" | "breakdown"; marginPct: number; volMult: number } | null {
-  if (bars.length < lookback + 1) return null;
+interface BreakDossier {
+  setup: "breakout" | "breakdown";
+  /** How far past the range the close is, as % of range width. */
+  marginPct: number;
+  /** Break-bar volume vs the lookback average. */
+  volMult: number;
+  /** Lookback range vs the PRIOR lookback range. <1 = the coil was tightening. */
+  squeeze: number;
+  /** Bars in the lookback that tested within 10% of the broken level. */
+  touches: number;
+  /** Where the bar closed relative to its own extreme, in the break direction (1 = at the extreme). */
+  closeLoc: number;
+  /** Break-bar range vs the average bar. Large = loud, impulsive break. */
+  impulse: number;
+}
+
+function detectBreak(bars: Bar[], lookback: number): BreakDossier | null {
+  if (bars.length < 2 * lookback + 1) return null;
   const last = bars[bars.length - 1];
   const prior = bars.slice(-lookback - 1, -1);
+  const before = bars.slice(-2 * lookback - 1, -lookback - 1);
   const hh = Math.max(...prior.map((b) => b.h));
   const ll = Math.min(...prior.map((b) => b.l));
   const range = hh - ll;
   if (range <= 0) return null;
+
+  const up = last.c > hh;
+  const down = last.c < ll;
+  if (!up && !down) return null;
+
   const avgVol = prior.reduce((a, b) => a + b.v, 0) / prior.length;
-  const volMult = avgVol > 0 ? last.v / avgVol : 0;
-  if (last.c > hh) {
-    return { setup: "breakout", marginPct: ((last.c - hh) / range) * 100, volMult };
-  }
-  if (last.c < ll) {
-    return { setup: "breakdown", marginPct: ((ll - last.c) / range) * 100, volMult };
-  }
-  return null;
+  const prevRange =
+    Math.max(...before.map((b) => b.h)) - Math.min(...before.map((b) => b.l));
+  const level = up ? hh : ll;
+  const near = range * 0.1;
+  const touches = prior.filter((b) =>
+    up ? b.h >= level - near : b.l <= level + near,
+  ).length;
+  const barRange = last.h - last.l;
+  const avgBar = prior.reduce((a, b) => a + (b.h - b.l), 0) / prior.length;
+
+  return {
+    setup: up ? "breakout" : "breakdown",
+    marginPct: ((up ? last.c - hh : ll - last.c) / range) * 100,
+    volMult: avgVol > 0 ? last.v / avgVol : 0,
+    squeeze: prevRange > 0 ? range / prevRange : 1,
+    touches,
+    closeLoc: barRange > 0 ? (up ? last.c - last.l : last.h - last.c) / barRange : 0.5,
+    impulse: avgBar > 0 ? barRange / avgBar : 1,
+  };
+}
+
+/**
+ * The dossier as prose, with the MEASURED base rates attached so the model
+ * grades the break against evidence from this market instead of textbook
+ * folklore — which the measurement inverted: loud, impulsive, conviction-close
+ * breaks REVERT here, quiet coiled ones mildly continue
+ * (tools/breakout_test.py, n=4497).
+ */
+function describeBreak(brk: BreakDossier, lookback: number): string {
+  const dir = brk.setup === "breakout" ? "ABOVE the high" : "BELOW the low";
+  const loud = brk.squeeze >= 0.7 && brk.impulse >= 1.5;
+  return [
+    `BREAKOUT DOSSIER: this bar closed ${dir} of the prior ${lookback} bars (${brk.setup}).`,
+    `- Margin past the range: ${brk.marginPct.toFixed(0)}% of range width.`,
+    `- Volume: ${brk.volMult.toFixed(1)}x the ${lookback}-bar average.`,
+    `- Range compression: ${brk.squeeze.toFixed(2)}x the prior ${lookback}-bar range ` +
+      `(${brk.squeeze < 0.7 ? "COMPRESSED — coiled before the break" : "expanded — already moving"}).`,
+    `- Level tested ${brk.touches} times before breaking.`,
+    `- Break bar: ${brk.impulse.toFixed(1)}x average size, closed ` +
+      `${(brk.closeLoc * 100).toFixed(0)}% toward its extreme.`,
+    `Measured on 4497 recent 1m breaks on these majors (10-bar horizon): ` +
+      `LOUD breaks (expanded range + bar >=1.5x) reverted -1.6 bps on average; ` +
+      `compressed or small-bar breaks mildly continued (+0.2 to +0.7). ` +
+      `Strong closes and volume surges did NOT help — they marked crowded, fading moves. ` +
+      `No category cleared costs by itself; your judgement decides.`,
+    loud
+      ? `This one is a LOUD break — the category that historically reverts.`
+      : `This one is a QUIET break — the category with mild follow-through.`,
+  ].join("\n");
 }
 
 /**
@@ -394,6 +463,8 @@ function advancePendingAndGhosts(bars: Bar[], symbol: string): void {
         requestedTargetBps: q.requestedTargetBps,
         makerEntry: true,
         setup: q.setup,
+        setupSqueeze: q.setupSqueeze,
+        setupImpulse: q.setupImpulse,
       });
       store.recordEntryFill();
       pending.splice(i, 1);
@@ -649,13 +720,8 @@ async function tickSymbol(
   if (cfg.llmBreakoutOnly && !brk) return "none";
 
   let decisionCtx = ctx;
-  if (brk) {
-    decisionCtx += `
-BREAK: this bar closed ${brk.setup === "breakout" ? "ABOVE the high" : "BELOW the low"} ` +
-      `of the prior ${cfg.llmBreakoutLookback} bars (${brk.setup}), clearing the range by ` +
-      `${brk.marginPct.toFixed(0)}% of its width on ${brk.volMult.toFixed(1)}x average volume. ` +
-      `Historically a 1m break continues or reverses about equally often — judge from the full picture.`;
-  }
+  if (brk) decisionCtx += `
+${describeBreak(brk, cfg.llmBreakoutLookback)}`;
 
   const { decision, error, ms } = await getDecision(
     creds.apiKey, cfg.llmDecisionModel || creds.model, decisionCtx,
@@ -754,6 +820,8 @@ BREAK: this bar closed ${brk.setup === "breakout" ? "ABOVE the high" : "BELOW th
         reason: decision.reason,
         confidence: decision.confidence,
         setup: brk?.setup,
+        setupSqueeze: brk?.squeeze,
+        setupImpulse: brk?.impulse,
         barsWaiting: 0,
         placedAt: Date.now(),
       });
@@ -793,6 +861,8 @@ BREAK: this bar closed ${brk.setup === "breakout" ? "ABOVE the high" : "BELOW th
       requestedTargetBps,
       makerEntry: false,
       setup: brk?.setup,
+      setupSqueeze: brk?.squeeze,
+      setupImpulse: brk?.impulse,
     });
 
     logger.info(
