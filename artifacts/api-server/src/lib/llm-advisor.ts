@@ -96,6 +96,173 @@ export function buildContext(symbol: string, bars: Bar[]): string {
   ].join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Coin selection — "which coin is best to trade right now?"
+// ---------------------------------------------------------------------------
+
+const FUT_24H = "https://fapi.binance.com/fapi/v1/ticker/24hr";
+
+export interface CoinPick {
+  symbol: string;
+  reason: string;
+  confidence: number;
+}
+
+/**
+ * Build a compact market survey of the most liquid perpetuals so the model has
+ * something concrete to choose between. Restricted to high-volume USDT perps —
+ * illiquid symbols have spreads that swallow any scalp (measured: wide-spread
+ * alts need >90% directional accuracy to break even).
+ */
+export async function buildMarketSurvey(top = 25): Promise<{ text: string; symbols: string[] }> {
+  const res = await fetch(FUT_24H, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`24hr HTTP ${res.status}`);
+  const rows = (await res.json()) as Record<string, string>[];
+
+  const usdt = rows
+    .filter((r) => r["symbol"]?.endsWith("USDT"))
+    .map((r) => ({
+      symbol: r["symbol"]!,
+      changePct: parseFloat(r["priceChangePercent"] ?? "0"),
+      quoteVol: parseFloat(r["quoteVolume"] ?? "0"),
+      high: parseFloat(r["highPrice"] ?? "0"),
+      low: parseFloat(r["lowPrice"] ?? "0"),
+      last: parseFloat(r["lastPrice"] ?? "0"),
+      trades: parseInt(r["count"] ?? "0", 10),
+    }))
+    .filter((r) => r.quoteVol > 0 && r.last > 0)
+    .sort((a, b) => b.quoteVol - a.quoteVol)
+    .slice(0, top);
+
+  const lines = usdt.map((r) => {
+    const rangePct = r.low > 0 ? ((r.high - r.low) / r.low) * 100 : 0;
+    const vol = r.quoteVol >= 1e9
+      ? `${(r.quoteVol / 1e9).toFixed(1)}B`
+      : `${(r.quoteVol / 1e6).toFixed(0)}M`;
+    return `${r.symbol},${r.changePct.toFixed(2)}%,${rangePct.toFixed(2)}%,${vol},${r.trades}`;
+  });
+
+  return {
+    text: [
+      "Most liquid USD-M perpetuals, last 24h.",
+      "Columns: symbol,24h_change,24h_range,quote_volume,trade_count",
+      "",
+      lines.join("\n"),
+    ].join("\n"),
+    symbols: usdt.map((r) => r.symbol),
+  };
+}
+
+const PICK_PROMPT = `You are helping choose which perpetual futures to scalp on a 1-minute timeframe.
+
+You will see the most liquid USD-M perps with 24h stats.
+
+Reply with ONLY JSON:
+{"picks":[{"symbol":"<SYMBOL>","reason":"<max 15 words>","confidence":<0-1>}, ... exactly 5 ...]}
+
+Choose the 5 you judge most tradeable right now. Only pick symbols from the list.
+Round-trip trading cost is 10 bps, so favour symbols whose typical movement can
+clear that. Be honest in the confidence field — low is fine.`;
+
+/** Ask the model for its 5 best symbols to trade now. */
+export async function suggestCoins(
+  apiKey: string,
+  model: string,
+): Promise<{ picks: CoinPick[]; error?: string; ms: number }> {
+  const started = Date.now();
+  let survey: { text: string; symbols: string[] };
+  try {
+    survey = await buildMarketSurvey();
+  } catch (err) {
+    return { picks: [], error: `market survey failed: ${String(err)}`, ms: Date.now() - started };
+  }
+
+  try {
+    const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: PICK_PROMPT },
+          { role: "user", content: survey.text },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.3,
+        max_tokens: 500,
+      }),
+      signal: AbortSignal.timeout(45_000),
+    });
+    const ms = Date.now() - started;
+    if (!res.ok) {
+      return { picks: [], error: `DeepSeek HTTP ${res.status}`, ms };
+    }
+    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    const raw = json.choices?.[0]?.message?.content ?? "";
+    const parsed = JSON.parse(raw) as { picks?: unknown[] };
+    const allowed = new Set(survey.symbols);
+
+    const picks: CoinPick[] = (parsed.picks ?? [])
+      .map((p) => p as Record<string, unknown>)
+      .map((p) => ({
+        symbol: String(p["symbol"] ?? "").toUpperCase(),
+        reason: String(p["reason"] ?? "").slice(0, 160),
+        confidence: Math.max(0, Math.min(1, Number(p["confidence"]) || 0)),
+      }))
+      // never let the model invent a symbol that is not actually tradeable
+      .filter((p) => allowed.has(p.symbol))
+      .slice(0, 5);
+
+    return { picks, ms };
+  } catch (err) {
+    return { picks: [], error: err instanceof Error ? err.message : String(err), ms: Date.now() - started };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Trade discussion — ask the model about a specific decision
+// ---------------------------------------------------------------------------
+
+export async function discussTrade(
+  apiKey: string,
+  model: string,
+  tradeContext: string,
+  question: string,
+  history: { role: "user" | "assistant"; content: string }[] = [],
+): Promise<{ answer: string | null; error?: string; ms: number }> {
+  const started = Date.now();
+  try {
+    const res = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are discussing a specific paper trade with the operator. Be concise and " +
+              "concrete. Round-trip cost is 10 bps — factor it in. If the trade was a losing " +
+              "one or the reasoning was weak, say so plainly rather than rationalising it.",
+          },
+          { role: "user", content: `Trade under discussion:\n${tradeContext}` },
+          ...history,
+          { role: "user", content: question },
+        ],
+        temperature: 0.4,
+        max_tokens: 500,
+      }),
+      signal: AbortSignal.timeout(45_000),
+    });
+    const ms = Date.now() - started;
+    if (!res.ok) return { answer: null, error: `DeepSeek HTTP ${res.status}`, ms };
+    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    return { answer: json.choices?.[0]?.message?.content ?? "", ms };
+  } catch (err) {
+    return { answer: null, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started };
+  }
+}
+
 const SYSTEM_PROMPT = `You are a futures scalping assistant. You will be shown recent 1-minute bars as basis-point offsets plus order-flow delta.
 
 Reply with ONLY a JSON object:

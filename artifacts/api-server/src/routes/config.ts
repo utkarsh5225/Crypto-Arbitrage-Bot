@@ -8,12 +8,14 @@ import {
 import { createClient } from "../lib/binance-client";
 import {
   hasLlmCredentials,
+  getLlmCredentials,
   getMaskedLlmKey,
   setLlmCredentials,
   clearLlmCredentials,
   testLlmCredentials,
   DEFAULT_MODEL,
 } from "../lib/llm-credentials";
+import { suggestCoins, discussTrade } from "../lib/llm-advisor";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
@@ -231,6 +233,114 @@ router.post("/config/llm", async (req, res) => {
     model: DEFAULT_MODEL,
     models: result.models,
   });
+});
+
+/**
+ * POST /api/llm/suggest — ask DeepSeek which 5 coins look best to trade now.
+ * Returns picks for the operator to choose from; does NOT start trading.
+ */
+router.post("/llm/suggest", async (_req, res) => {
+  const creds = getLlmCredentials();
+  if (!creds) {
+    res.status(400).json({ error: "No DeepSeek API key configured" });
+    return;
+  }
+  const { picks, error, ms } = await suggestCoins(creds.apiKey, creds.model);
+  if (!picks.length) {
+    res.status(502).json({ error: error || "DeepSeek returned no usable picks" });
+    return;
+  }
+  store.llmPicks = picks;
+  store.llmPicksAt = Date.now();
+  logger.info({ count: picks.length, ms }, "DeepSeek coin picks received");
+  res.json({ picks, ms, at: store.llmPicksAt });
+});
+
+/** GET /api/llm/picks — last set of picks */
+router.get("/llm/picks", (_req, res) => {
+  res.json({ picks: store.llmPicks, at: store.llmPicksAt, selected: store.config.llmSymbols });
+});
+
+/**
+ * POST /api/llm/select — choose which picked symbols to trade, and optionally
+ * start the loop in the same call.
+ */
+router.post("/llm/select", (req, res) => {
+  const body = req.body as { symbols?: unknown; start?: unknown };
+  if (!Array.isArray(body.symbols) || body.symbols.length === 0) {
+    res.status(400).json({ error: "symbols must be a non-empty array" });
+    return;
+  }
+  const valid = body.symbols
+    .map((s) => String(s).toUpperCase())
+    .filter((s) => /^[A-Z0-9]{4,20}$/.test(s));
+  if (!valid.length) {
+    res.status(400).json({ error: "no valid symbols supplied" });
+    return;
+  }
+  store.config.llmSymbols = valid;
+  if (body.start === true) {
+    if (!hasLlmCredentials()) {
+      res.status(400).json({ error: "No DeepSeek API key configured" });
+      return;
+    }
+    store.config.llmEnabled = true;
+  }
+  store.persistConfig();
+  logger.info({ symbols: valid, started: body.start === true }, "LLM symbols selected");
+  res.json({ symbols: valid, llmEnabled: store.config.llmEnabled });
+});
+
+/**
+ * POST /api/llm/discuss — talk to DeepSeek about a specific paper trade.
+ * Keeps a per-trade thread so the conversation has continuity.
+ */
+router.post("/llm/discuss", async (req, res) => {
+  const body = req.body as { tradeId?: unknown; question?: unknown };
+  if (typeof body.tradeId !== "string" || typeof body.question !== "string" || !body.question.trim()) {
+    res.status(400).json({ error: "tradeId and question are required" });
+    return;
+  }
+  const creds = getLlmCredentials();
+  if (!creds) {
+    res.status(400).json({ error: "No DeepSeek API key configured" });
+    return;
+  }
+  const trade = store.llmTrades.find((t) => t.id === body.tradeId);
+  if (!trade) {
+    res.status(404).json({ error: "trade not found" });
+    return;
+  }
+
+  const ctx = [
+    `Symbol: ${trade.symbol}`,
+    `Side: ${trade.side}`,
+    `Entry: ${trade.entry}  Exit: ${trade.exit}  (${trade.how})`,
+    `Gross: ${trade.grossBps.toFixed(1)} bps | Net after 10 bps cost: ${trade.netBps.toFixed(1)} bps`,
+    `A same-instant coin flip with identical stop/target returned: ${trade.ctrlNetBps.toFixed(1)} bps`,
+    `Bars held: ${trade.bars}`,
+    `Your original reasoning for this trade was: "${trade.reason}"`,
+  ].join("\n");
+
+  const thread = store.llmDiscussions[trade.id] ?? [];
+  const history = thread.map((m) => ({ role: m.role, content: m.content }));
+  const { answer, error, ms } = await discussTrade(
+    creds.apiKey, creds.model, ctx, body.question.trim(), history,
+  );
+  if (answer === null) {
+    res.status(502).json({ error: error || "DeepSeek did not respond" });
+    return;
+  }
+  thread.push({ role: "user", content: body.question.trim(), at: Date.now() });
+  thread.push({ role: "assistant", content: answer, at: Date.now() });
+  store.llmDiscussions[trade.id] = thread.slice(-20);
+  logger.info({ tradeId: trade.id, ms }, "LLM trade discussion exchange");
+  res.json({ answer, thread: store.llmDiscussions[trade.id] });
+});
+
+/** GET /api/llm/discuss/:id — existing thread for a trade */
+router.get("/llm/discuss/:id", (req, res) => {
+  res.json({ thread: store.llmDiscussions[String(req.params["id"])] ?? [] });
 });
 
 /** GET /api/llm/stats — scoring for the DeepSeek paper loop */

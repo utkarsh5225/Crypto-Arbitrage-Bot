@@ -178,6 +178,82 @@ export default function Dashboard() {
     });
   };
 
+  // ── Coin picks: ask DeepSeek which coins to trade, then choose ─────────────
+  const [picks, setPicks] = useState<any[]>([]);
+  const [picking, setPicking] = useState(false);
+  const [chosen, setChosen] = useState<string[]>([]);
+
+  useEffect(() => {
+    fetch('/api/llm/picks').then(r => r.json()).then(d => {
+      setPicks(d.picks ?? []);
+      setChosen(d.selected ?? []);
+    }).catch(() => {});
+  }, []);
+
+  const handleAskPicks = () => {
+    setPicking(true);
+    fetch('/api/llm/suggest', { method: 'POST' })
+      .then(async r => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Failed');
+        setPicks(d.picks ?? []);
+        setChosen([]);
+        toast.success(`DeepSeek suggested ${d.picks.length} coins (${d.ms}ms)`);
+      })
+      .catch(e => toast.error(e?.message ?? 'Could not get picks'))
+      .finally(() => setPicking(false));
+  };
+
+  const toggleChosen = (sym: string) =>
+    setChosen(c => c.includes(sym) ? c.filter(x => x !== sym) : [...c, sym]);
+
+  const handleStartSelected = (start: boolean) => {
+    if (!chosen.length) { toast.error('Select at least one coin'); return; }
+    fetch('/api/llm/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbols: chosen, start }),
+    })
+      .then(async r => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Failed');
+        toast.success(start ? `Trading ${d.symbols.join(', ')} (paper)` : 'Selection saved');
+        refetchConfig();
+      })
+      .catch(e => toast.error(e?.message ?? 'Could not start'));
+  };
+
+  // ── Discuss a trade with DeepSeek ─────────────────────────────────────────
+  const [discussId, setDiscussId] = useState<string | null>(null);
+  const [thread, setThread] = useState<any[]>([]);
+  const [question, setQuestion] = useState('');
+  const [asking, setAsking] = useState(false);
+
+  const openDiscussion = (id: string) => {
+    setDiscussId(id);
+    setThread([]);
+    fetch(`/api/llm/discuss/${id}`).then(r => r.json())
+      .then(d => setThread(d.thread ?? [])).catch(() => {});
+  };
+
+  const askQuestion = () => {
+    if (!discussId || !question.trim()) return;
+    setAsking(true);
+    fetch('/api/llm/discuss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tradeId: discussId, question: question.trim() }),
+    })
+      .then(async r => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Failed');
+        setThread(d.thread ?? []);
+        setQuestion('');
+      })
+      .catch(e => toast.error(e?.message ?? 'DeepSeek did not respond'))
+      .finally(() => setAsking(false));
+  };
+
   // ── Live mode confirmation modal ───────────────────────────────────────────
   const [showLiveConfirm, setShowLiveConfirm] = useState(false);
 
@@ -880,6 +956,71 @@ export default function Dashboard() {
             </Badge>
           </CardHeader>
           <CardContent className="space-y-4">
+            {/* Step 1 — ask DeepSeek which coins to trade */}
+            <div className="rounded-md border border-border p-3 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-bold">1 · Which coin should we trade?</p>
+                  <p className="text-[10px] text-muted-foreground">
+                    DeepSeek reviews the most liquid perps and picks 5. You choose.
+                  </p>
+                </div>
+                <Button onClick={handleAskPicks} disabled={picking} size="sm" variant="outline" className="h-8 text-xs font-bold">
+                  {picking ? 'Asking...' : 'Ask DeepSeek'}
+                </Button>
+              </div>
+
+              {picks.length > 0 && (
+                <>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {picks.map((p) => {
+                      const sel = chosen.includes(p.symbol);
+                      return (
+                        <button
+                          key={p.symbol}
+                          onClick={() => toggleChosen(p.symbol)}
+                          className={cn(
+                            'text-left rounded-md border p-2 transition-colors',
+                            sel ? 'border-primary bg-primary/10' : 'border-border hover:border-muted-foreground',
+                          )}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold">{p.symbol}</span>
+                            <span className={cn('text-[10px] font-mono',
+                              p.confidence >= 0.6 ? 'text-green-400' : 'text-muted-foreground')}>
+                              {(p.confidence * 100).toFixed(0)}%
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-muted-foreground mt-1 leading-snug">{p.reason}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button onClick={() => setChosen(picks.map(p => p.symbol))} size="sm" variant="outline" className="h-7 text-[10px]">
+                      Select all 5
+                    </Button>
+                    <Button onClick={() => setChosen([])} size="sm" variant="outline" className="h-7 text-[10px]">
+                      Clear
+                    </Button>
+                    <div className="flex-1" />
+                    <Button
+                      onClick={() => handleStartSelected(true)}
+                      disabled={!chosen.length}
+                      size="sm"
+                      className="h-8 text-xs font-bold bg-primary text-background hover:bg-primary/80"
+                    >
+                      Start trading {chosen.length || ''} selected (Paper)
+                    </Button>
+                  </div>
+                  <p className="text-[10px] text-muted-foreground">
+                    Confidence is the model's own claim about itself — recorded, never trusted.
+                    The scoreboard below is what actually decides whether it works.
+                  </p>
+                </>
+              )}
+            </div>
+
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <div>
                 <p className="text-[10px] uppercase text-muted-foreground">Trades</p>
@@ -932,6 +1073,7 @@ export default function Dashboard() {
                       <TableHead className="text-right">Flip</TableHead>
                       <TableHead className="w-[60px]">Exit</TableHead>
                       <TableHead>Model reasoning</TableHead>
+                      <TableHead className="w-[70px]"></TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -947,13 +1089,61 @@ export default function Dashboard() {
                           {t.ctrlNetBps > 0 ? '+' : ''}{Number(t.ctrlNetBps).toFixed(1)}
                         </TableCell>
                         <TableCell className="text-muted-foreground">{t.how}</TableCell>
-                        <TableCell className="text-muted-foreground truncate max-w-[260px]" title={t.reason}>
+                        <TableCell className="text-muted-foreground truncate max-w-[220px]" title={t.reason}>
                           {t.reason}
+                        </TableCell>
+                        <TableCell>
+                          <button
+                            onClick={() => openDiscussion(t.id)}
+                            className="text-[10px] uppercase tracking-wider text-primary hover:underline"
+                          >
+                            Discuss
+                          </button>
                         </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
                 </Table>
+              </div>
+            )}
+
+            {/* Discussion panel — interrogate a specific trade */}
+            {discussId && (
+              <div className="rounded-md border border-primary/40 p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-bold">Discussing trade {discussId}</p>
+                  <button onClick={() => setDiscussId(null)} className="text-[10px] text-muted-foreground hover:text-foreground">
+                    close
+                  </button>
+                </div>
+                <div className="max-h-52 overflow-auto space-y-2">
+                  {thread.length === 0 && (
+                    <p className="text-[10px] text-muted-foreground">
+                      Ask why it took this trade, whether the reasoning held up, or what it would do differently.
+                    </p>
+                  )}
+                  {thread.map((m, i) => (
+                    <div key={i} className={cn('text-xs rounded px-2 py-1.5',
+                      m.role === 'user' ? 'bg-muted/40 text-foreground' : 'bg-primary/10 text-foreground')}>
+                      <span className="text-[9px] uppercase tracking-wider text-muted-foreground block mb-0.5">
+                        {m.role === 'user' ? 'You' : 'DeepSeek'}
+                      </span>
+                      <span className="whitespace-pre-wrap leading-relaxed">{m.content}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-2">
+                  <Input
+                    value={question}
+                    onChange={e => setQuestion(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !asking) askQuestion(); }}
+                    placeholder="Why did you take this trade?"
+                    className="bg-background/50 h-8 text-xs"
+                  />
+                  <Button onClick={askQuestion} disabled={asking || !question.trim()} size="sm" variant="outline" className="h-8 text-xs">
+                    {asking ? '...' : 'Ask'}
+                  </Button>
+                </div>
               </div>
             )}
           </CardContent>

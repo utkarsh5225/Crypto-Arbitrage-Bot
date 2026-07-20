@@ -71,11 +71,12 @@ function resolveCtrl(p: OpenPosition, bar: Bar): number | null {
   return null;
 }
 
-/** Advance open positions against the latest bar; close finished ones. */
-function updateOpen(bars: Bar[]): void {
+/** Advance this symbol's open positions against its latest bar; close finished ones. */
+function updateOpen(bars: Bar[], symbol: string): void {
   const bar = bars[bars.length - 1];
   for (let i = open.length - 1; i >= 0; i--) {
     const p = open[i];
+    if (p.symbol !== symbol) continue;   // only mark against its own market
     p.bars += 1;
 
     if (p.ctrlOpen) {
@@ -126,41 +127,39 @@ function updateOpen(bars: Bar[]): void {
   }
 }
 
-async function tick(): Promise<void> {
-  if (inFlight) return;
+/** Symbols the operator selected from DeepSeek's picks (falls back to the single field). */
+function activeSymbols(): string[] {
+  const sel = store.config.llmSymbols;
+  return sel && sel.length > 0 ? sel : [store.config.llmSymbol];
+}
+
+async function tickSymbol(symbol: string, creds: { apiKey: string; model: string }): Promise<void> {
   const cfg = store.config;
-  if (!cfg.llmEnabled) return;
+  const bars = await fetchFuturesKlines(symbol, "1m", 60);
+  updateOpen(bars, symbol);
 
-  const creds = getLlmCredentials();
-  if (!creds) return;
+  // one position per symbol — an LLM will happily open ten
+  if (open.some((p) => p.symbol === symbol)) return;
 
-  inFlight = true;
-  try {
-    const symbol = cfg.llmSymbol;
-    const bars = await fetchFuturesKlines(symbol, "1m", 60);
-    updateOpen(bars);
+  // hard cap so a chatty model cannot rack up unlimited (simulated) cost
+  if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return;
 
-    // one position at a time — an LLM will happily open ten
-    if (open.length > 0) return;
+  const ctx = buildContext(symbol, bars);
+  const { decision, error, ms } = await getDecision(creds.apiKey, creds.model, ctx);
 
-    // hard cap so a chatty model cannot rack up unlimited (simulated) cost
-    if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return;
+  store.bumpLlmCalls(ms);
+  if (!decision) {
+    logger.warn({ symbol, error, ms }, "DeepSeek decision unusable — skipping");
+    return;
+  }
+  if (decision.action === "flat") {
+    store.addLlmSkip();
+    logger.info({ symbol, reason: decision.reason }, "DeepSeek: flat");
+    sseManager.broadcast("llm_stats", store.getLlmStats());
+    return;
+  }
 
-    const ctx = buildContext(symbol, bars);
-    const { decision, error, ms } = await getDecision(creds.apiKey, creds.model, ctx);
-
-    store.bumpLlmCalls(ms);
-    if (!decision) {
-      logger.warn({ error, ms }, "DeepSeek decision unusable — skipping");
-      return;
-    }
-    if (decision.action === "flat") {
-      store.addLlmSkip();
-      logger.info({ reason: decision.reason }, "DeepSeek: flat");
-      sseManager.broadcast("llm_stats", store.getLlmStats());
-      return;
-    }
-
+  {
     const last = bars[bars.length - 1];
     const entry = last.c;
     const stopD = (decision.stopBps / 1e4) * entry;
@@ -191,8 +190,29 @@ async function tick(): Promise<void> {
       "DeepSeek paper position opened",
     );
     sseManager.broadcast("llm_stats", store.getLlmStats());
-  } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : String(err) }, "LLM tick failed");
+  }
+}
+
+async function tick(): Promise<void> {
+  if (inFlight) return;
+  if (!store.config.llmEnabled) return;
+  const creds = getLlmCredentials();
+  if (!creds) return;
+
+  inFlight = true;
+  try {
+    // Sequential, not parallel: keeps API usage predictable and avoids racing
+    // several decisions against the same per-day cap.
+    for (const symbol of activeSymbols()) {
+      try {
+        await tickSymbol(symbol, creds);
+      } catch (err) {
+        logger.warn(
+          { symbol, err: err instanceof Error ? err.message : String(err) },
+          "LLM tick failed for symbol",
+        );
+      }
+    }
   } finally {
     inFlight = false;
   }

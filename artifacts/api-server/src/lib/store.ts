@@ -34,8 +34,10 @@ export interface BotConfig {
   // ── DeepSeek (LLM) scalping — PAPER ONLY ──────────────────────────────────
   /** Master switch for the LLM decision loop. */
   llmEnabled: boolean;
-  /** Perpetual symbol the LLM trades. */
+  /** Perpetual symbol the LLM trades (legacy single-symbol field). */
   llmSymbol: string;
+  /** Symbols selected from DeepSeek's picks. Empty = fall back to llmSymbol. */
+  llmSymbols: string[];
   /** Seconds between decisions (min 30; 60 = the 1m scalping cadence). */
   llmIntervalSec: number;
   /** Hard cap on simulated trades per day, so a chatty model cannot spam. */
@@ -197,9 +199,16 @@ class Store {
     maxQuoteAgeMs: 1000,
     llmEnabled: false,
     llmSymbol: "BTCUSDT",
+    llmSymbols: [],
     llmIntervalSec: 60,
     llmMaxTradesPerDay: 200,
   };
+
+  /** Latest coin picks returned by DeepSeek, awaiting operator selection. */
+  llmPicks: { symbol: string; reason: string; confidence: number }[] = [];
+  llmPicksAt = 0;
+  /** Per-trade discussion threads, keyed by trade id. */
+  llmDiscussions: Record<string, { role: "user" | "assistant"; content: string; at: number }[]> = {};
 
   llmTrades: LlmTrade[] = [];
   llmSkips = 0;
