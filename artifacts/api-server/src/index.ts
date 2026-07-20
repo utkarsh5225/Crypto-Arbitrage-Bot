@@ -1,7 +1,6 @@
 import type { Server } from "http";
 import app from "./app";
 import { logger } from "./lib/logger";
-import { startScanner, stopTrading, isLiveTradeInFlight } from "./lib/scanner";
 import { startLlmTrader, stopLlmTrader } from "./lib/llm-trader";
 import { store } from "./lib/store";
 
@@ -32,11 +31,6 @@ const server: Server = app.listen(port, host, (err?: Error) => {
 
   logger.info({ host, port }, "Server listening");
 
-  // Start the triangular arbitrage scanner
-  startScanner().catch((scannerErr) => {
-    logger.error({ err: scannerErr }, "Scanner failed to start");
-  });
-
   // Start the DeepSeek decision loop. It is a no-op until llmEnabled is set and
   // a key is configured, and it only ever paper-trades.
   startLlmTrader();
@@ -45,9 +39,11 @@ const server: Server = app.listen(port, host, (err?: Error) => {
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 //
-// On SIGTERM/SIGINT (e.g. `systemctl restart`): stop starting new live trades,
-// briefly wait for any in-flight triangle to settle, flush trade history to
-// disk, close the server, and exit. A hard timeout guarantees we still exit.
+// On SIGTERM/SIGINT (e.g. `systemctl restart`): stop the decision loop, flush
+// state to disk, close the server, and exit. A hard timeout guarantees we still
+// exit. (The arbitrage scanner and its in-flight-trade drain were removed with
+// the arb engine — the LLM loop only paper-trades, so there is nothing to
+// settle on the exchange.)
 // ---------------------------------------------------------------------------
 
 let shuttingDown = false;
@@ -57,17 +53,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   logger.info({ signal }, "Shutdown signal received — draining");
 
-  stopTrading();
   stopLlmTrader();
-
-  // Wait up to ~6s for an in-flight live trade to finish before flushing.
-  const deadline = Date.now() + 6_000;
-  while (isLiveTradeInFlight() && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  if (isLiveTradeInFlight()) {
-    logger.warn("A live trade was still in flight at shutdown deadline — flushing anyway");
-  }
 
   store.flush();
   logger.info("Store flushed to disk");
