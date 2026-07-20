@@ -64,6 +64,14 @@ export interface BotConfig {
    * (cleaner read of its unmodified judgement, but discards most trades).
    */
   llmRejectLowRR: boolean;
+  /**
+   * Minimum stop distance as a multiple of the recent average 1m bar range.
+   *
+   * Measured: 8 of the first 10 trades were stopped out, average hold 2.6
+   * minutes and several within a single bar - the stops were sitting inside
+   * ordinary noise. This floors them against actual volatility.
+   */
+  llmMinStopVolMult: number;
 }
 
 /** One completed LLM paper trade, with its coin-flip control. */
@@ -75,8 +83,13 @@ export interface LlmTrade {
   exit: number;
   grossBps: number;
   netBps: number;
-  /** same-instant random-direction control, same stop/target, net of cost */
+  /**
+   * Expected result of choosing the direction at random = mean of the model's
+   * side and the mirrored counterfactual. Compare netBps against this.
+   */
   ctrlNetBps: number;
+  /** The mirrored (opposite-side) counterfactual result, net of cost. */
+  oppNetBps?: number;
   how: string;
   bars: number;
   reason: string;
@@ -233,6 +246,7 @@ class Store {
     llmCostAware: false,
     llmMinRiskReward: 2.0,
     llmRejectLowRR: false,
+    llmMinStopVolMult: 2.0,
   };
 
   /** Latest coin picks returned by DeepSeek, awaiting operator selection. */
@@ -249,6 +263,7 @@ class Store {
   llmRrAdjusted = 0;
   llmRrRejected = 0;
   llmReviews = 0;
+  llmStopWidened = 0;
 
   opportunities: ArbitrageOpportunity[] = [];
   trades: PaperTrade[] = [];
@@ -490,6 +505,7 @@ class Store {
   bumpRrAdjusted(): void { this.llmRrAdjusted += 1; }
   bumpRrRejected(): void { this.llmRrRejected += 1; }
   bumpLlmReviews(): void { this.llmReviews += 1; }
+  bumpStopWidened(): void { this.llmStopWidened += 1; }
 
   bumpLlmCalls(ms: number): void {
     this.llmCalls += 1;
@@ -522,6 +538,10 @@ class Store {
       edgeVsRandom: net - ctrl,
       totalNetBps: t.reduce((a, b) => a + b.netBps, 0),
       roundTripCostBps: 10,
+      longs: t.filter((x) => x.side === "long").length,
+      shorts: t.filter((x) => x.side === "short").length,
+      avgOppNetBps: n ? mean(t.map((x) => x.oppNetBps ?? 0)) : 0,
+      stopWidened: this.llmStopWidened,
       rrAdjusted: this.llmRrAdjusted,
       rrRejected: this.llmRrRejected,
       reviews: this.llmReviews,
