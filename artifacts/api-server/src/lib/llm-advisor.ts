@@ -64,7 +64,7 @@ export async function fetchFuturesKlines(
  * prompt small AND avoids handing the model a literal price it might recognise
  * from its training data.
  */
-export function buildContext(symbol: string, bars: Bar[]): string {
+export function buildContext(symbol: string, bars: Bar[], costLine?: string): string {
   const last = bars[bars.length - 1];
   const ref = last.c;
   const recent = bars.slice(-30);
@@ -92,7 +92,7 @@ export function buildContext(symbol: string, bars: Bar[]): string {
     ``,
     `Last 5-bar return: ${ret5} bps. Last 15-bar return: ${ret15} bps.`,
     `Average 1m bar range: ${avgRng} bps.`,
-    `Round-trip trading cost: 10 bps. A trade must clear that to be profitable.`,
+    costLine ?? `Round-trip trading cost: 10 bps. A trade must clear that to be profitable.`,
   ].join("\n");
 }
 

@@ -71,6 +71,38 @@ export interface BotConfig {
    */
   llmMinHoldBars: number;
   /**
+   * Only open positions on symbols currently BREAKING OUT of (or down from)
+   * their recent range.
+   *
+   * Measured before building (tools/breakout_test.py, 4541 breaks): following
+   * a break averaged -0.19 bps gross — a coin flip. This filter is therefore an
+   * INSTRUMENT, not a strategy: it isolates breakout trades so their edge can
+   * be judged separately, and it gates WHEN to trade, never which way.
+   */
+  llmBreakoutOnly: boolean;
+  /** Bars of prior range a close must clear to count as a break. */
+  llmBreakoutLookback: number;
+  /**
+   * Enter with a resting limit at the touch (maker, 2 bps) instead of crossing
+   * the spread (taker, 5 bps).
+   *
+   * This is the only lever that changes the arithmetic: the round trip drops
+   * from 10 bps to ~4 (target, maker out) / ~7 (stopped, market out). The
+   * catch is non-fills — a resting limit fills preferentially when the market
+   * comes to you, i.e. when the trade is going wrong. Every non-fill is
+   * recorded with what it WOULD have returned so that bias is measured.
+   */
+  llmMakerEntry: boolean;
+  /** Bars a pending entry limit may wait before it is cancelled unfilled. */
+  llmMakerFillTimeoutBars: number;
+  /**
+   * Hard ceiling on stop distance. A trade needing a wider stop is REJECTED,
+   * not clamped — clamping would place a stop tighter than the volatility
+   * floor said was survivable. Unbounded stops are merely ugly on paper and
+   * genuinely dangerous with leverage.
+   */
+  llmMaxStopBps: number;
+  /**
    * An exit must clear this fraction of the stop distance before it is allowed.
    *
    * The model was sizing a ~300 bps stop and then exiting on a 31 bps wiggle.
@@ -150,6 +182,10 @@ export interface LlmTrade {
   stopBps?: number;
   /** Latest in-trade review the model gave, if any. */
   lastReview?: string;
+  /** What triggered the entry — set when the breakout filter is on. */
+  setup?: "breakout" | "breakdown";
+  /** Round-trip cost actually charged (maker/taker aware), bps. */
+  costBps?: number;
 }
 
 export interface ArbitrageOpportunity {
@@ -294,6 +330,11 @@ class Store {
     llmRepickMinutes: 15,
     llmMinHoldBars: 5,
     llmExitMinAdverseFrac: 0.5,
+    llmBreakoutOnly: true,
+    llmBreakoutLookback: 20,
+    llmMakerEntry: true,
+    llmMakerFillTimeoutBars: 3,
+    llmMaxStopBps: 150,
     llmIntervalSec: 60,
     llmMaxTradesPerDay: 200,
     llmCostAware: false,
@@ -326,6 +367,11 @@ class Store {
   llmReviews = 0;
   llmStopWidened = 0;
   llmExitsBlocked = 0;
+  llmStopCapRejected = 0;
+  llmEntryFills = 0;
+  llmEntryNonFills = 0;
+  /** What the unfilled entries WOULD have returned — the maker-entry lie detector. */
+  llmNonFillResults: number[] = [];
 
   opportunities: ArbitrageOpportunity[] = [];
   trades: PaperTrade[] = [];
@@ -569,6 +615,13 @@ class Store {
   bumpLlmReviews(): void { this.llmReviews += 1; }
   bumpStopWidened(): void { this.llmStopWidened += 1; }
   bumpExitsBlocked(): void { this.llmExitsBlocked += 1; }
+  bumpStopCapRejected(): void { this.llmStopCapRejected += 1; }
+  recordEntryFill(): void { this.llmEntryFills += 1; }
+  recordEntryNonFill(wouldHaveNetBps: number): void {
+    this.llmEntryNonFills += 1;
+    this.llmNonFillResults.push(wouldHaveNetBps);
+    if (this.llmNonFillResults.length > 500) this.llmNonFillResults.shift();
+  }
 
   bumpLlmCalls(ms: number): void {
     this.llmCalls += 1;
@@ -605,12 +658,27 @@ class Store {
       avgRandomNetBps: ctrl,
       edgeVsRandom: net - ctrl,
       totalNetBps: t.reduce((a, b) => a + b.netBps, 0),
-      roundTripCostBps: 10,
+      avgCostBps: mean(t.map((x) => x.costBps ?? 10)),
       longs: t.filter((x) => x.side === "long").length,
       shorts: t.filter((x) => x.side === "short").length,
       avgOppNetBps: n ? mean(t.map((x) => x.oppNetBps ?? 0)) : 0,
       stopWidened: this.llmStopWidened,
       exitsBlocked: this.llmExitsBlocked,
+      stopCapRejected: this.llmStopCapRejected,
+      // Maker-entry honesty: if the trades that got away were the good ones,
+      // the fee saving is an illusion and this is where it shows.
+      entryFills: this.llmEntryFills,
+      entryNonFills: this.llmEntryNonFills,
+      fillRate: this.llmEntryFills + this.llmEntryNonFills
+        ? this.llmEntryFills / (this.llmEntryFills + this.llmEntryNonFills)
+        : 1,
+      avgNonFillWouldBeBps: mean(this.llmNonFillResults),
+      // Breakout trades vs everything else — the whole point of the filter.
+      bySetup: [
+        { setup: "breakout", ...bucket(t.filter((x) => x.setup === "breakout")) },
+        { setup: "breakdown", ...bucket(t.filter((x) => x.setup === "breakdown")) },
+        { setup: "none", ...bucket(t.filter((x) => !x.setup)) },
+      ],
       rrAdjusted: this.llmRrAdjusted,
       rrRejected: this.llmRrRejected,
       reviews: this.llmReviews,

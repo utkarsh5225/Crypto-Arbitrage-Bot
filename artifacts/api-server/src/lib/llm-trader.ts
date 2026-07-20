@@ -34,9 +34,33 @@ import {
   type Bar,
 } from "./llm-advisor";
 
-/** USD-M futures taker, both sides. Same figure used across the analysis tools. */
-const ROUND_TRIP_BPS = 10;
+/**
+ * Fee model, USD-M futures retail tier.
+ *
+ * The flat 10 bps round trip (taker both ways) was 77% of all losses over the
+ * first 9 trades, so entries now rest at the touch as maker orders. The costs
+ * are asymmetric ON PURPOSE and must stay that way:
+ *
+ *   maker entry + target hit   2 + 2 = ~4 bps   (target is a resting limit)
+ *   maker entry + stopped out  2 + 5 = ~7 bps   (a stop is a market order —
+ *                                                it is NEVER a maker fill)
+ *
+ * With llmMakerEntry off, both sides cross: 5 + 5 = the original 10.
+ */
+const TAKER_BPS = 5;
+const MAKER_BPS = 2;
 const MAX_HOLD_BARS = 30;
+
+function entryCost(makerEntry: boolean): number {
+  return makerEntry ? MAKER_BPS : TAKER_BPS;
+}
+/** Only a target exit can be a maker fill; stops, timeouts and manual exits cross. */
+function exitCost(makerEntry: boolean, how: string): number {
+  return how === "target" ? entryCost(makerEntry) : TAKER_BPS;
+}
+function roundTrip(makerEntry: boolean, how: string): number {
+  return entryCost(makerEntry) + exitCost(makerEntry, how);
+}
 
 let timer: NodeJS.Timeout | null = null;
 let markTimer: NodeJS.Timeout | null = null;
@@ -84,9 +108,49 @@ export interface OpenPosition {
   /** Latest in-trade review from the model. */
   lastReview?: string;
   lastReviewAt?: number;
+  /** Entered via resting limit (maker) — decides the fee charged on each exit. */
+  makerEntry: boolean;
+  /** What triggered the entry, when the breakout filter is on. */
+  setup?: "breakout" | "breakdown";
+}
+
+/**
+ * A decision waiting for its entry limit to fill.
+ *
+ * The maker saving is only real if the order actually fills, and fills are
+ * adversely selected: the market coming back to the limit correlates with the
+ * trade going wrong. So a timed-out entry is not discarded — it becomes a
+ * GHOST that is tracked to its stop/target and recorded as what the trade
+ * would have returned. If the ghosts outperform the fills, maker entry is a
+ * mirage and the stats will show it.
+ */
+interface PendingEntry {
+  symbol: string;
+  side: "long" | "short";
+  limit: number;
+  stopBps: number;
+  targetBps: number;
+  requestedTargetBps?: number;
+  reason: string;
+  confidence: number;
+  setup?: "breakout" | "breakdown";
+  barsWaiting: number;
+  placedAt: number;
+}
+
+/** An unfilled entry, simulated as if it had filled, for the non-fill record. */
+interface GhostPosition {
+  symbol: string;
+  side: "long" | "short";
+  entry: number;
+  stop: number;
+  target: number;
+  bars: number;
 }
 
 const open: OpenPosition[] = [];
+const pending: PendingEntry[] = [];
+const ghosts: GhostPosition[] = [];
 
 function resolveOne(p: OpenPosition, bar: Bar): { done: boolean; px?: number; how?: string } {
   if (p.side === "long") {
@@ -99,25 +163,30 @@ function resolveOne(p: OpenPosition, bar: Bar): { done: boolean; px?: number; ho
   return { done: false };
 }
 
-/** Resolve the mirrored (opposite-side) counterfactual against this bar. */
-function resolveOpp(p: OpenPosition, bar: Bar): number | null {
+/**
+ * Resolve the mirrored (opposite-side) counterfactual against this bar.
+ * Returns gross bps and HOW it closed, so the caller can charge the identical
+ * maker/taker cost model as the real side — charging the control a different
+ * fee would silently bias edgeVsRandom.
+ */
+function resolveOpp(p: OpenPosition, bar: Bar): { bps: number; how: string } | null {
   if (!p.oppOpen) return null;
   const oppSide = p.side === "long" ? "short" : "long";
   if (oppSide === "long") {
-    if (bar.l <= p.oppStop) return ((p.oppStop - p.entry) / p.entry) * 1e4;
-    if (bar.h >= p.oppTarget) return ((p.oppTarget - p.entry) / p.entry) * 1e4;
+    if (bar.l <= p.oppStop) return { bps: ((p.oppStop - p.entry) / p.entry) * 1e4, how: "stop" };
+    if (bar.h >= p.oppTarget) return { bps: ((p.oppTarget - p.entry) / p.entry) * 1e4, how: "target" };
   } else {
-    if (bar.h >= p.oppStop) return ((p.entry - p.oppStop) / p.entry) * 1e4;
-    if (bar.l <= p.oppTarget) return ((p.entry - p.oppTarget) / p.entry) * 1e4;
+    if (bar.h >= p.oppStop) return { bps: ((p.entry - p.oppStop) / p.entry) * 1e4, how: "stop" };
+    if (bar.l <= p.oppTarget) return { bps: ((p.entry - p.oppTarget) / p.entry) * 1e4, how: "target" };
   }
   return null;
 }
 
-/** Mark the opposite side to a price, used when the model's side closes first. */
+/** Mark the opposite side to a price (a market close, so always taker out). */
 function markOpp(p: OpenPosition, px: number): number {
   const oppSide = p.side === "long" ? "short" : "long";
   const g = ((oppSide === "long" ? px - p.entry : p.entry - px) / p.entry) * 1e4;
-  return g - ROUND_TRIP_BPS;
+  return g - (entryCost(p.makerEntry) + TAKER_BPS);
 }
 
 /** Advance this symbol's open positions against its latest bar; close finished ones. */
@@ -135,7 +204,10 @@ function updateOpen(bars: Bar[], symbol: string): void {
 
     if (p.oppOpen) {
       const c = resolveOpp(p, bar);
-      if (c !== null) { p.oppResultBps = c - ROUND_TRIP_BPS; p.oppOpen = false; }
+      if (c !== null) {
+        p.oppResultBps = c.bps - roundTrip(p.makerEntry, c.how);
+        p.oppOpen = false;
+      }
     }
 
     const r = resolveOne(p, bar);
@@ -147,7 +219,8 @@ function updateOpen(bars: Bar[], symbol: string): void {
 
     const grossBps =
       ((p.side === "long" ? exitPx - p.entry : p.entry - exitPx) / p.entry) * 1e4;
-    const netBps = grossBps - ROUND_TRIP_BPS;
+    const cost = roundTrip(p.makerEntry, how);
+    const netBps = grossBps - cost;
 
     if (p.oppOpen) {
       // Counterfactual still open — mark it at the same instant for fairness.
@@ -176,6 +249,8 @@ function updateOpen(bars: Bar[], symbol: string): void {
       enforcedTargetBps: p.targetBps,
       stopBps: p.stopBps,
       lastReview: p.lastReview,
+      setup: p.setup,
+      costBps: cost,
     });
     logger.info(
       { symbol: p.symbol, side: p.side, how, grossBps: grossBps.toFixed(1), netBps: netBps.toFixed(1) },
@@ -228,7 +303,8 @@ function closeNow(p: OpenPosition, px: number, how: string): void {
     p.oppResultBps = markOpp(p, px);
     p.oppOpen = false;
   }
-  const netB = grossBps - ROUND_TRIP_BPS;
+  const cost = entryCost(p.makerEntry) + TAKER_BPS;
+  const netB = grossBps - cost;
   store.addLlmTrade({
     id: p.id, symbol: p.symbol, side: p.side, entry: p.entry, exit: px,
     grossBps, netBps: netB,
@@ -240,15 +316,153 @@ function closeNow(p: OpenPosition, px: number, how: string): void {
     enforcedTargetBps: p.targetBps,
     stopBps: p.stopBps,
     lastReview: p.lastReview,
+    setup: p.setup,
+    costBps: cost,
   });
   const i = open.indexOf(p);
   if (i >= 0) open.splice(i, 1);
   sseManager.broadcast("llm_stats", store.getLlmStats());
 }
 
+/**
+ * Break state of the LATEST bar against the prior `lookback` bars' extremes.
+ *
+ * Computed from bars the tick already fetched — costs nothing. Measured before
+ * building (tools/breakout_test.py, n=4541): following a 1m break averaged
+ * -0.19 bps gross, i.e. a coin flip. The filter gates WHEN a decision may be
+ * made, never WHICH WAY — forcing the break direction would bake in an edge
+ * the data says is not there.
+ */
+function detectBreak(
+  bars: Bar[],
+  lookback: number,
+): { setup: "breakout" | "breakdown"; marginPct: number; volMult: number } | null {
+  if (bars.length < lookback + 1) return null;
+  const last = bars[bars.length - 1];
+  const prior = bars.slice(-lookback - 1, -1);
+  const hh = Math.max(...prior.map((b) => b.h));
+  const ll = Math.min(...prior.map((b) => b.l));
+  const range = hh - ll;
+  if (range <= 0) return null;
+  const avgVol = prior.reduce((a, b) => a + b.v, 0) / prior.length;
+  const volMult = avgVol > 0 ? last.v / avgVol : 0;
+  if (last.c > hh) {
+    return { setup: "breakout", marginPct: ((last.c - hh) / range) * 100, volMult };
+  }
+  if (last.c < ll) {
+    return { setup: "breakdown", marginPct: ((ll - last.c) / range) * 100, volMult };
+  }
+  return null;
+}
+
+/**
+ * Advance pending entry limits and ghost positions against this symbol's
+ * latest bar. Runs before updateOpen so a fill starts being tracked on the
+ * next tick, not retroactively against the bar that filled it.
+ */
+function advancePendingAndGhosts(bars: Bar[], symbol: string): void {
+  const bar = bars[bars.length - 1];
+  const cfg = store.config;
+
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const q = pending[i];
+    if (q.symbol !== symbol) continue;
+    q.barsWaiting += 1;
+
+    const filled = q.side === "long" ? bar.l <= q.limit : bar.h >= q.limit;
+    if (filled) {
+      const stopD = (q.stopBps / 1e4) * q.limit;
+      const tgtD = (q.targetBps / 1e4) * q.limit;
+      open.push({
+        id: `${Date.now()}`,
+        symbol: q.symbol,
+        side: q.side,
+        entry: q.limit,
+        stop: q.side === "long" ? q.limit - stopD : q.limit + stopD,
+        target: q.side === "long" ? q.limit + tgtD : q.limit - tgtD,
+        openedAt: Date.now(),
+        bars: 0,
+        reason: q.reason,
+        confidence: q.confidence,
+        oppStop: q.side === "long" ? q.limit + stopD : q.limit - stopD,
+        oppTarget: q.side === "long" ? q.limit - tgtD : q.limit + tgtD,
+        oppOpen: true,
+        lastPrice: q.limit,
+        unrealBps: 0,
+        stopBps: q.stopBps,
+        targetBps: q.targetBps,
+        requestedTargetBps: q.requestedTargetBps,
+        makerEntry: true,
+        setup: q.setup,
+      });
+      store.recordEntryFill();
+      pending.splice(i, 1);
+      logger.info({ symbol, side: q.side, limit: q.limit, waited: q.barsWaiting },
+        "Entry limit filled (maker)");
+      continue;
+    }
+
+    if (q.barsWaiting >= cfg.llmMakerFillTimeoutBars) {
+      // The trade never happened — but its outcome still matters. Track the
+      // ghost so the non-fill record can say what got away.
+      const stopD = (q.stopBps / 1e4) * q.limit;
+      const tgtD = (q.targetBps / 1e4) * q.limit;
+      ghosts.push({
+        symbol: q.symbol,
+        side: q.side,
+        entry: q.limit,
+        stop: q.side === "long" ? q.limit - stopD : q.limit + stopD,
+        target: q.side === "long" ? q.limit + tgtD : q.limit - tgtD,
+        bars: 0,
+      });
+      pending.splice(i, 1);
+      logger.info({ symbol, side: q.side, waited: q.barsWaiting },
+        "Entry limit timed out unfilled — tracking as ghost");
+    }
+  }
+
+  for (let i = ghosts.length - 1; i >= 0; i--) {
+    const g = ghosts[i];
+    if (g.symbol !== symbol) continue;
+    g.bars += 1;
+    let gross: number | null = null;
+    let how = "";
+    if (g.side === "long") {
+      if (bar.l <= g.stop) { gross = ((g.stop - g.entry) / g.entry) * 1e4; how = "stop"; }
+      else if (bar.h >= g.target) { gross = ((g.target - g.entry) / g.entry) * 1e4; how = "target"; }
+    } else {
+      if (bar.h >= g.stop) { gross = ((g.entry - g.stop) / g.entry) * 1e4; how = "stop"; }
+      else if (bar.l <= g.target) { gross = ((g.entry - g.target) / g.entry) * 1e4; how = "target"; }
+    }
+    if (gross === null && g.bars >= MAX_HOLD_BARS) {
+      gross = ((g.side === "long" ? bar.c - g.entry : g.entry - bar.c) / g.entry) * 1e4;
+      how = "timeout";
+    }
+    if (gross === null) continue;
+    const net = gross - roundTrip(true, how);
+    store.recordEntryNonFill(net);
+    ghosts.splice(i, 1);
+    logger.info({ symbol, side: g.side, how, wouldHaveNetBps: +net.toFixed(1) },
+      "Ghost resolved — this is what the unfilled entry would have returned");
+  }
+}
+
 /** Symbols currently holding a position (deduped — one symbol can only be held once). */
 function heldSymbols(): string[] {
   return [...new Set(open.map((p) => p.symbol))];
+}
+
+/**
+ * Symbols that need their bars advanced every tick even with no open position:
+ * pending limits must get their fill/timeout checked and ghosts must resolve,
+ * or an unscanned symbol would leave them frozen.
+ */
+function managedSymbols(): string[] {
+  return [...new Set([
+    ...open.map((p) => p.symbol),
+    ...pending.map((q) => q.symbol),
+    ...ghosts.map((g) => g.symbol),
+  ])];
 }
 
 /**
@@ -331,10 +545,19 @@ async function tickSymbol(
 ): Promise<TickResult> {
   const cfg = store.config;
   const bars = await fetchFuturesKlines(symbol, "1m", 60);
+  advancePendingAndGhosts(bars, symbol);
   updateOpen(bars, symbol);
 
+  // A pending limit already commits this symbol (and a slot) — no new decision.
+  if (pending.some((q) => q.symbol === symbol)) return "none";
+
   const enrichment = await buildEnrichment(symbol).catch(() => "");
-  const ctx = buildContext(symbol, bars) + enrichment;
+  const costLine = cfg.llmMakerEntry
+    ? `Round-trip cost: ~${2 * MAKER_BPS} bps if your target is hit (maker in, maker out), ` +
+      `~${MAKER_BPS + TAKER_BPS} bps if stopped or exited early (a stop is a market order). ` +
+      `Your entry rests at the touch and may not fill.`
+    : undefined;
+  const ctx = buildContext(symbol, bars, costLine) + enrichment;
 
   // ── Manage an already-open position rather than ignoring it ────────────────
   const held = open.find((p) => p.symbol === symbol);
@@ -376,7 +599,7 @@ async function tickSymbol(
       // early exits so far averaged +0.31 bps gross and -9.69 bps net.
       const unreal = held.unrealBps ?? 0;
       const adverseEnough = unreal <= -held.stopBps * cfg.llmExitMinAdverseFrac;
-      const profitEnough = unreal >= ROUND_TRIP_BPS * 2;
+      const profitEnough = unreal >= (entryCost(held.makerEntry) + TAKER_BPS) * 2;
 
       if (adverseEnough || profitEnough) {
         closeNow(held, held.lastPrice ?? held.entry, "llm_exit");
@@ -417,8 +640,25 @@ async function tickSymbol(
   // hard cap so a chatty model cannot rack up unlimited (simulated) cost
   if (store.getLlmStats().today >= cfg.llmMaxTradesPerDay) return "none";
 
+  // ── Breakout gate ──────────────────────────────────────────────────────────
+  // Checked BEFORE the decision call: a symbol that is not breaking costs zero
+  // tokens. The gate decides WHEN a decision may happen — the model still
+  // chooses the side and may still say flat, because following and fading a
+  // break both measured as coin flips (tools/breakout_test.py).
+  const brk = detectBreak(bars, cfg.llmBreakoutLookback);
+  if (cfg.llmBreakoutOnly && !brk) return "none";
+
+  let decisionCtx = ctx;
+  if (brk) {
+    decisionCtx += `
+BREAK: this bar closed ${brk.setup === "breakout" ? "ABOVE the high" : "BELOW the low"} ` +
+      `of the prior ${cfg.llmBreakoutLookback} bars (${brk.setup}), clearing the range by ` +
+      `${brk.marginPct.toFixed(0)}% of its width on ${brk.volMult.toFixed(1)}x average volume. ` +
+      `Historically a 1m break continues or reverses about equally often — judge from the full picture.`;
+  }
+
   const { decision, error, ms } = await getDecision(
-    creds.apiKey, cfg.llmDecisionModel || creds.model, ctx,
+    creds.apiKey, cfg.llmDecisionModel || creds.model, decisionCtx,
     cfg.llmCostAware, cfg.llmMinRiskReward,
   );
 
@@ -461,6 +701,18 @@ async function tickSymbol(
       store.bumpStopWidened();
     }
 
+    // ── Hard stop cap ────────────────────────────────────────────────────────
+    // REJECT rather than clamp: clamping would place a stop tighter than the
+    // volatility floor just said was survivable — the worst of both settings.
+    if (stopBps > cfg.llmMaxStopBps) {
+      store.bumpStopCapRejected();
+      logger.warn(
+        { symbol, stopBps: +stopBps.toFixed(1), maxStopBps: cfg.llmMaxStopBps },
+        "Rejected trade — required stop exceeds the maximum",
+      );
+      return "none";
+    }
+
     const minRR = cfg.llmMinRiskReward;
     const requestedTargetBps = decision.targetBps;
     let targetBps = decision.targetBps;
@@ -487,9 +739,37 @@ async function tickSymbol(
       );
     }
 
+    const side = decision.action;
+
+    if (cfg.llmMakerEntry) {
+      // Rest at the touch and wait. The position opens only if the market
+      // trades back to the limit; otherwise it times out into a ghost.
+      pending.push({
+        symbol,
+        side,
+        limit: entry,
+        stopBps,
+        targetBps,
+        requestedTargetBps,
+        reason: decision.reason,
+        confidence: decision.confidence,
+        setup: brk?.setup,
+        barsWaiting: 0,
+        placedAt: Date.now(),
+      });
+      logger.info(
+        { symbol, side, limit: entry, stopBps: +stopBps.toFixed(1),
+          targetBps: +targetBps.toFixed(1), setup: brk?.setup,
+          confidence: decision.confidence, reason: decision.reason },
+        "Entry limit placed (maker) — waiting for a fill",
+      );
+      sseManager.broadcast("llm_stats", store.getLlmStats());
+      // The slot is committed even though the position is not open yet.
+      return "opened";
+    }
+
     const stopD = (stopBps / 1e4) * entry;
     const tgtD = (targetBps / 1e4) * entry;
-    const side = decision.action;
 
     open.push({
       id: `${Date.now()}`,
@@ -511,6 +791,8 @@ async function tickSymbol(
       stopBps,
       targetBps,
       requestedTargetBps,
+      makerEntry: false,
+      setup: brk?.setup,
     });
 
     logger.info(
@@ -549,16 +831,20 @@ async function tick(): Promise<void> {
       }
     };
 
-    // ── 1. Manage what is already open ───────────────────────────────────────
-    // Unconditional and first: an open position needs its stop/target resolved
-    // and its review run whether or not there is room for anything new.
-    for (const symbol of heldSymbols()) await run(symbol, false);
+    // ── 1. Manage what is already committed ──────────────────────────────────
+    // Unconditional and first: open positions need stops/targets resolved,
+    // pending limits need fill/timeout checks, ghosts need resolving —
+    // whether or not there is room for anything new.
+    for (const symbol of managedSymbols()) await run(symbol, false);
 
     // ── 2. Fill free slots ───────────────────────────────────────────────────
-    const free0 = Math.max(0, cfg.llmMaxConcurrent - open.length);
+    // A pending limit holds a slot: it can become a position at any bar.
+    const free0 = Math.max(0, cfg.llmMaxConcurrent - open.length - pending.length);
     if (free0 === 0) return;
 
-    const pool = candidatePool().filter((s) => !open.some((p) => p.symbol === s));
+    const pool = candidatePool().filter(
+      (s) => !open.some((p) => p.symbol === s) && !pending.some((q) => q.symbol === s),
+    );
     if (pool.length === 0) return;
 
     // Bounded scan: at most 2 look-ups per free slot, from a rotating cursor.
@@ -596,4 +882,8 @@ export function stopLlmTrader(): void {
 
 export function getOpenLlmPositions(): OpenPosition[] {
   return open;
+}
+
+export function getPendingLlmEntries(): PendingEntry[] {
+  return pending;
 }

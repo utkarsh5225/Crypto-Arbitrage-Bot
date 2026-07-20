@@ -16,7 +16,7 @@ import {
   DEFAULT_MODEL,
 } from "../lib/llm-credentials";
 import { suggestCoins, discussTrade } from "../lib/llm-advisor";
-import { getOpenLlmPositions } from "../lib/llm-trader";
+import { getOpenLlmPositions, getPendingLlmEntries } from "../lib/llm-trader";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
@@ -50,6 +50,11 @@ router.put("/config", (req, res) => {
     llmMaxConcurrent?: unknown;
     llmRepickMinutes?: unknown;
     llmMinHoldBars?: unknown;
+    llmBreakoutOnly?: unknown;
+    llmBreakoutLookback?: unknown;
+    llmMakerEntry?: unknown;
+    llmMakerFillTimeoutBars?: unknown;
+    llmMaxStopBps?: unknown;
     llmExitMinAdverseFrac?: unknown;
   };
 
@@ -151,6 +156,38 @@ router.put("/config", (req, res) => {
     body.llmRepickMinutes <= 240
   ) {
     store.config.llmRepickMinutes = body.llmRepickMinutes;
+  }
+  if (typeof body.llmBreakoutOnly === "boolean") {
+    store.config.llmBreakoutOnly = body.llmBreakoutOnly;
+    logger.info({ breakoutOnly: body.llmBreakoutOnly }, "LLM breakout filter toggled");
+  }
+  if (
+    typeof body.llmBreakoutLookback === "number" &&
+    Number.isInteger(body.llmBreakoutLookback) &&
+    body.llmBreakoutLookback >= 5 &&
+    body.llmBreakoutLookback <= 120
+  ) {
+    store.config.llmBreakoutLookback = body.llmBreakoutLookback;
+  }
+  if (typeof body.llmMakerEntry === "boolean") {
+    store.config.llmMakerEntry = body.llmMakerEntry;
+    logger.info({ makerEntry: body.llmMakerEntry }, "LLM entry style changed");
+  }
+  if (
+    typeof body.llmMakerFillTimeoutBars === "number" &&
+    Number.isInteger(body.llmMakerFillTimeoutBars) &&
+    body.llmMakerFillTimeoutBars >= 1 &&
+    body.llmMakerFillTimeoutBars <= 30
+  ) {
+    store.config.llmMakerFillTimeoutBars = body.llmMakerFillTimeoutBars;
+  }
+  if (
+    typeof body.llmMaxStopBps === "number" &&
+    body.llmMaxStopBps >= 10 &&
+    body.llmMaxStopBps <= 1000
+  ) {
+    store.config.llmMaxStopBps = body.llmMaxStopBps;
+    logger.info({ maxStopBps: body.llmMaxStopBps }, "LLM stop cap changed");
   }
   if (
     typeof body.llmMinHoldBars === "number" &&
@@ -439,8 +476,22 @@ router.get("/llm/open", (_req, res) => {
     requestedTargetBps: p.requestedTargetBps,
     lastReview: p.lastReview,
     lastReviewAt: p.lastReviewAt,
+    setup: p.setup,
+    makerEntry: p.makerEntry,
   }));
-  res.json({ open: rows });
+  const pendingRows = getPendingLlmEntries().map((q) => ({
+    symbol: q.symbol,
+    side: q.side,
+    limit: q.limit,
+    stopBps: q.stopBps,
+    targetBps: q.targetBps,
+    barsWaiting: q.barsWaiting,
+    placedAt: q.placedAt,
+    reason: q.reason,
+    confidence: q.confidence,
+    setup: q.setup,
+  }));
+  res.json({ open: rows, pending: pendingRows });
 });
 
 /** GET /api/llm/stats — scoring for the DeepSeek paper loop */

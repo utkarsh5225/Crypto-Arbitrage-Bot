@@ -174,6 +174,7 @@ export default function Dashboard() {
   const [llmTrades, setLlmTrades] = useState<any[]>([]);
 
   const [llmOpen, setLlmOpen] = useState<any[]>([]);
+  const [llmPending, setLlmPending] = useState<any[]>([]);
 
   useEffect(() => {
     const pull = () => {
@@ -183,7 +184,8 @@ export default function Dashboard() {
     };
     const pullOpen = () => {
       fetch('/api/llm/open').then(r => r.json())
-        .then(d => setLlmOpen(d.open ?? [])).catch(() => {});
+        .then(d => { setLlmOpen(d.open ?? []); setLlmPending(d.pending ?? []); })
+        .catch(() => {});
     };
     pull(); pullOpen();
     const h = setInterval(pull, 10000);
@@ -560,7 +562,9 @@ export default function Dashboard() {
           label="Open Signals"
           value={llmOpen.length}
           valueClass={llmOpen.length > 0 ? 'text-primary' : 'text-muted-foreground'}
-          sublabel={llmOpen.length > 0 ? llmOpen.map((o: any) => o.symbol).join(', ') : 'waiting for a call'}
+          sublabel={llmOpen.length > 0
+            ? llmOpen.map((o: any) => o.symbol).join(', ')
+            : llmPending.length > 0 ? `${llmPending.length} limit${llmPending.length > 1 ? 's' : ''} waiting to fill` : 'waiting for a call'}
         />
         <StatCard
           label="Closed Trades"
@@ -573,7 +577,7 @@ export default function Dashboard() {
           label="Avg Net / Trade"
           value={`${(llmStats?.avgNetBps ?? 0).toFixed(1)} bps`}
           valueClass={(llmStats?.avgNetBps ?? 0) > 0 ? 'text-green-400' : 'text-destructive'}
-          sublabel={`after ${llmStats?.roundTripCostBps ?? 10} bps cost`}
+          sublabel={`avg cost ${(llmStats?.avgCostBps ?? 10).toFixed(1)} bps (maker-aware)`}
         />
         <StatCard
           label="Edge vs Random"
@@ -977,6 +981,37 @@ export default function Dashboard() {
               </p>
             </div>
 
+            {/* PENDING ENTRIES — maker limits waiting to fill */}
+            {llmPending.length > 0 && (
+              <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 space-y-2">
+                <p className="text-xs font-bold text-amber-400">
+                  WAITING FOR FILL — resting limit orders (maker)
+                </p>
+                {llmPending.map((q: any) => (
+                  <div key={`${q.symbol}-${q.placedAt}`} className="rounded border border-border bg-background/60 p-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-bold',
+                        q.side === 'long' ? 'bg-green-500/20 text-green-400' : 'bg-destructive/20 text-destructive')}>
+                        {String(q.side).toUpperCase()}
+                      </span>
+                      <span className="font-bold">{q.symbol}</span>
+                      {q.setup && <span className="text-[9px] uppercase text-muted-foreground">{q.setup}</span>}
+                      <span className="font-mono">limit {Number(q.limit).toPrecision(6)}</span>
+                      <div className="flex-1" />
+                      <span className="text-[10px] text-muted-foreground">
+                        waiting {q.barsWaiting} bar{q.barsWaiting === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-1 italic">"{q.reason}"</p>
+                  </div>
+                ))}
+                <p className="text-[10px] text-muted-foreground">
+                  A limit that does not fill within {config?.llmMakerFillTimeoutBars ?? 3} bars is cancelled —
+                  but still tracked, so we learn what the unfilled trades would have done.
+                </p>
+              </div>
+            )}
+
             {/* ACTIVE SIGNALS — what the model wants traded right now */}
             <div className="rounded-md border-2 border-primary/50 bg-primary/5 p-3">
               <div className="flex items-center justify-between mb-2">
@@ -989,8 +1024,9 @@ export default function Dashboard() {
 
               {llmOpen.length === 0 ? (
                 <p className="text-[11px] text-muted-foreground">
-                  No open signal right now. When DeepSeek makes a call it appears here with
-                  exact entry, stop and target.
+                  {llmPending.length > 0
+                    ? 'No filled position yet — entry limits below are waiting for the market to come to them.'
+                    : 'No open signal right now. When DeepSeek makes a call it appears here with exact entry, stop and target.'}
                 </p>
               ) : (
                 <div className="space-y-2">
@@ -1002,6 +1038,12 @@ export default function Dashboard() {
                           {String(o.side).toUpperCase()}
                         </span>
                         <span className="text-sm font-bold">{o.symbol}</span>
+                        {o.setup && (
+                          <span className={cn('text-[9px] font-bold px-1.5 py-0.5 rounded uppercase',
+                            o.setup === 'breakout' ? 'bg-green-500/15 text-green-400' : 'bg-destructive/15 text-destructive')}>
+                            {o.setup}
+                          </span>
+                        )}
                         <span className="text-[10px] text-muted-foreground">
                           {(() => {
                             const s = Math.max(0, Math.floor((now - o.openedAt) / 1000));
@@ -1100,6 +1142,48 @@ export default function Dashboard() {
                 Near zero = no edge, however confident the reasoning sounds. Needs ~100+ trades to mean anything.
               </p>
             </div>
+
+            {/* MEASUREMENT — breakout split and maker-fill honesty */}
+            {((llmStats?.entryFills ?? 0) + (llmStats?.entryNonFills ?? 0) > 0 ||
+              (llmStats?.bySetup ?? []).some((b: any) => b.n > 0)) && (
+              <div className="rounded-md border border-border p-3 space-y-2">
+                <p className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">
+                  Measurement — is any of this actually working?
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                  {(llmStats?.bySetup ?? []).filter((b: any) => b.n > 0).map((b: any) => (
+                    <div key={b.setup} className="rounded border border-border p-2">
+                      <p className="text-[9px] uppercase text-muted-foreground">{b.setup} trades</p>
+                      <p className={cn('font-bold font-mono',
+                        b.avgNetBps > 0 ? 'text-green-400' : 'text-destructive')}>
+                        {b.avgNetBps >= 0 ? '+' : ''}{Number(b.avgNetBps).toFixed(1)} bps
+                      </p>
+                      <p className="text-[9px] text-muted-foreground">
+                        n={b.n} · win {(b.winRate * 100).toFixed(0)}%
+                      </p>
+                    </div>
+                  ))}
+                  {(llmStats?.entryFills ?? 0) + (llmStats?.entryNonFills ?? 0) > 0 && (
+                    <div className="rounded border border-border p-2">
+                      <p className="text-[9px] uppercase text-muted-foreground">Entry fill rate</p>
+                      <p className="font-bold font-mono">
+                        {((llmStats?.fillRate ?? 1) * 100).toFixed(0)}%
+                      </p>
+                      <p className="text-[9px] text-muted-foreground">
+                        {llmStats?.entryNonFills ?? 0} missed
+                        {(llmStats?.entryNonFills ?? 0) > 0 &&
+                          ` · would've made ${(llmStats?.avgNonFillWouldBeBps ?? 0) >= 0 ? '+' : ''}${Number(llmStats?.avgNonFillWouldBeBps ?? 0).toFixed(1)} bps`}
+                      </p>
+                    </div>
+                  )}
+                </div>
+                <p className="text-[10px] text-muted-foreground">
+                  If the missed entries keep outperforming the filled ones, the maker fee saving
+                  is an illusion (the market only fills you when the trade is going wrong) and
+                  maker entry should be turned off.
+                </p>
+              </div>
+            )}
 
             {llmTrades.length > 0 && (
               <div className="overflow-auto max-h-56">
