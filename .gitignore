@@ -49,5 +49,9 @@ Thumbs.db
 .local/
 .binance-credentials.json
 
+# LenDenClub bot secrets (session token + personal config)
+artifacts/lenden-bot/config.json
+artifacts/lenden-bot/.lenden-session.json
+
 # Persistent store data
 artifacts/api-server/data/

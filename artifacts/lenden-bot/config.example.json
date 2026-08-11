@@ -1,0 +1,25 @@
+{
+  "mobileNumber": "",
+  "budgetINR": 5000,
+  "live": false,
+  "strategy": {
+    "maxPerLoanINR": 500,
+    "maxPerBorrowerINR": 2000,
+    "minInterestRatePct": 12,
+    "maxTenureMonths": 24,
+    "lotSizeINR": 250,
+    "gradeCapsPct": { "A": 100, "B": 60, "C": 25, "D": 10, "E": 0, "unknown": 10 },
+    "assumedDefaultRatesPct": { "A": 2, "B": 4, "C": 8, "D": 14, "E": 22, "unknown": 12 }
+  },
+  "api": {
+    "baseUrl": "",
+    "endpoints": {
+      "sendOtp": "/v2/auth/otp/send",
+      "verifyOtp": "/v2/auth/otp/verify",
+      "loans": "/v2/lending/loans",
+      "balance": "/v2/wallet/balance",
+      "invest": "/v2/lending/invest"
+    },
+    "extraHeaders": {}
+  }
+}
